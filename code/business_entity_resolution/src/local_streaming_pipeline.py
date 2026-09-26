@@ -23,9 +23,6 @@ CACHE_DIR = "temp_cache"
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-CANDIDATE_OUT = os.path.join(OUT_DIR, "candidate_pairs.tsv")
-MATCHING_OUT = os.path.join(OUT_DIR, "matching_results.tsv")
-
 INDIC_REGEX = re.compile(r'[\u0900-\u0D7F]')
 CORP_STOPWORDS = {
     'private', 'limited', 'ltd', 'pvt', 'inc', 'llc', 'corp', 'corporation',
@@ -135,11 +132,10 @@ def encode_to_disk(texts, model, tokenizer, device, file_path, batch_size=256):
 
 def run_test_inference(target_countries=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
 
-    print("[Loading SOTA Dual Models: LightGBM + CatBoost]")
-    lgb_model = joblib.load("lgb_ensemble.pkl")
-    cb_model = joblib.load("cb_ensemble.pkl")
+    print("[Loading 5-Fold Ensembles]")
+    models = [joblib.load(f"lgb_fold_{f}.pkl") for f in range(5)]
 
     print("[Loading Test Dataset]")
     s1_df = pl.read_csv(os.path.join(DATA_DIR, "test_source1.tsv"), separator="\t")
@@ -151,19 +147,19 @@ def run_test_inference(target_countries=None):
 
     all_countries = s1_df["country"].unique().to_list()
     countries = [c for c in all_countries if c in target_countries] if target_countries else all_countries
-    print(f"Target Partitions to execute: {countries}")
+    print(f"Target Partitions: {countries}")
 
-    tag = "_".join(countries) if countries else "all"
-    cand_path = os.path.join(OUT_DIR, f"candidate_pairs_{tag}.tsv")
-    match_path = os.path.join(OUT_DIR, f"matching_results_{tag}.tsv")
+    tag = "_".join(countries) if target_countries else "final"
+    cand_path = os.path.join(OUT_DIR, f"candidate_pairs_{tag}.tsv" if target_countries else "candidate_pairs.tsv")
+    match_path = os.path.join(OUT_DIR, f"matching_results_{tag}.tsv" if target_countries else "matching_results.tsv")
 
     f_cand = open(cand_path, "w", encoding="utf-8")
     f_match = open(match_path, "w", encoding="utf-8")
     f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
     f_match.write("source1_entity_id\tmatched_entity_ids\n")
 
-    tok = AutoTokenizer.from_pretrained("BAAI/bge-m3")
-    mod = AutoModel.from_pretrained("BAAI/bge-m3", torch_dtype=torch.float16).to(device).eval()
+    tok = AutoTokenizer.from_pretrained("BAAI/bge-m3", local_files_only=True)
+    mod = AutoModel.from_pretrained("BAAI/bge-m3", torch_dtype=torch.float16, local_files_only=True).to(device).eval()
 
     def process_df(df):
         texts, meta = [], []
@@ -174,6 +170,10 @@ def run_test_inference(target_countries=None):
             meta.append(m)
             texts.append(f"[COL] name [VAL] {m[0][0]} [COL] address [VAL] {str(a or '').lower()}")
         return texts, meta
+
+    K = 25
+    ANCHOR_THRESH = 0.84
+    SISTER_THRESH = 0.76
 
     for country in countries:
         print(f"\n==================================================")
@@ -217,14 +217,14 @@ def run_test_inference(target_countries=None):
             s1_chunk = torch.from_numpy(s1_mmap[i:i+s1_chunk_size]).to(device)
             c_len = s1_chunk.shape[0]
 
-            best_scores = np.full((c_len, 15), -1.0, dtype=np.float32)
-            best_indices = np.full((c_len, 15), -1, dtype=np.int64)
+            best_scores = np.full((c_len, K), -1.0, dtype=np.float32)
+            best_indices = np.full((c_len, K), -1, dtype=np.int64)
 
             for b_start in range(0, n_ops, ops_block_size):
                 b_end = min(b_start + ops_block_size, n_ops)
                 ops_block = torch.from_numpy(ops_mmap[b_start:b_end]).to(device)
                 sims = torch.matmul(s1_chunk, ops_block.T)
-                block_vals, block_inds = torch.topk(sims, k=min(15, ops_block.shape[0]), dim=1)
+                block_vals, block_inds = torch.topk(sims, k=min(K, ops_block.shape[0]), dim=1)
 
                 b_vals_np = block_vals.cpu().numpy()
                 b_inds_np = (block_inds + b_start).cpu().numpy()
@@ -232,7 +232,7 @@ def run_test_inference(target_countries=None):
                 for r in range(c_len):
                     comb_scores = np.concatenate([best_scores[r], b_vals_np[r]])
                     comb_indices = np.concatenate([best_indices[r], b_inds_np[r]])
-                    top_idx = np.argsort(comb_scores)[::-1][:15]
+                    top_idx = np.argsort(comb_scores)[::-1][:K]
                     best_scores[r] = comb_scores[top_idx]
                     best_indices[r] = comb_indices[top_idx]
 
@@ -254,7 +254,7 @@ def run_test_inference(target_countries=None):
 
                 cands = []
                 for rank_pos, (score, c_idx) in enumerate(zip(row_vals, row_inds)):
-                    if c_idx != -1 and score >= 0.55:
+                    if c_idx != -1 and score >= 0.52:
                         c_idx_int = int(c_idx)
                         cands.append(ops_ids[c_idx_int])
                         feats = compute_features_22(s1_meta[global_idx], ops_meta[c_idx_int], score, rank_pos, margin_delta)
@@ -264,16 +264,14 @@ def run_test_inference(target_countries=None):
 
             if chunk_pairs:
                 X_chunk = np.array(chunk_pairs)
-                p_lgb = lgb_model.predict_proba(X_chunk)[:, 1]
-                p_cb = cb_model.predict_proba(X_chunk)[:, 1]
-                probs = (p_lgb * 0.55) + (p_cb * 0.45)
+                probs = np.mean([m.predict_proba(X_chunk)[:, 1] for m in models], axis=0)
 
                 for (sid, c_idx_int), prob in zip(chunk_coords, probs):
-                    if prob >= 0.89:
+                    if prob >= ANCHOR_THRESH:
                         s1_has_anchor.add(sid)
                         if c_idx_int not in best_ops_assignment or prob > best_ops_assignment[c_idx_int][1]:
                             best_ops_assignment[c_idx_int] = (sid, float(prob))
-                    elif sid in s1_has_anchor and prob >= 0.78:
+                    elif sid in s1_has_anchor and prob >= SISTER_THRESH:
                         if c_idx_int not in best_ops_assignment or prob > best_ops_assignment[c_idx_int][1]:
                             best_ops_assignment[c_idx_int] = (sid, float(prob))
 
@@ -301,12 +299,12 @@ def run_test_inference(target_countries=None):
 
     f_cand.close()
     f_match.close()
-    print(f"\nPartition {countries} completed! Saved to {match_path} and {cand_path}")
+    print(f"\nExecution finished! Saved to {match_path} and {cand_path}")
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Multi-machine Partitioned Streaming Pipeline")
-    parser.add_argument("--countries", nargs="+", default=None, help="Countries to process, e.g. --countries US or --countries India France")
+    parser = argparse.ArgumentParser(description="Distributed or Local Production Pipeline")
+    parser.add_argument("--countries", nargs="+", default=None, help="Target country partitions")
     args = parser.parse_args()
 
     run_test_inference(target_countries=args.countries)
