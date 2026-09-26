@@ -1,5 +1,6 @@
 # ---- Challenge data (never commit; repository is public) ----
 data/raw/**
+data/clean/**
 data/processed/**
 data/interim/**
 !data/README.md
