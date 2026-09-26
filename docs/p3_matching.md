@@ -304,6 +304,38 @@ Production implications, if adopted:
 - `candidate_pairs.tsv` must list the HYBRID set (`src/pipeline/hybrid.py`), since every predicted match must be a
   candidate.
 
+### K=100 (development sample only): not worth it
+
+K=100 candidates were generated for the same development S1 (99 s) and the A+C+E matcher was retrained at K=100
+(1,027 s).
+
+K=100 alone scores 0.9465: below K=20 (0.9494), with India 0.9306, US 0.9571, singletons 0.922 and threshold 0.75.
+This is the same pattern as K=50.
+
+The fair test is incremental: K=100 candidates not already in hybrid50, scored with the K=100 OOF probability and
+added on top of the adopted hybrid50 result. The K=20 base and the K=50 deep layer keep exclusivity priority.
+
+| Set (random development S1) | Pair recall | Ceiling | Candidates / S1 | All true retained |
+|---|---|---|---|---|
+| K20 | 0.9493 | 0.9815 | 20 | 85.3% |
+| hybrid50 | 0.9654 | 0.9874 | 50 | 89.8% |
+| hybrid100 | 0.9714 | 0.9897 | 100 | 91.5% |
+
+The incremental pool has 1,458,307 rows with 576 true (0.04%); the median probability of those true pairs is 0.46.
+
+| Added on top of hybrid50 (0.9525) | macro-F0.5 | Δ vs hybrid50 (paired ±SE) | India | US | Singletons | Added TP / FP |
+|---|---|---|---|---|---|---|
+| K=100 layer, prob ≥ 0.70 | 0.9529 | +0.0004 ± 0.0002 | 0.9398 | 0.9617 | 0.926 | 181 / 64 |
+| K=100 layer, prob ≥ 0.85 (best) | 0.9530 | +0.0005 ± 0.0001 | 0.9400 | 0.9617 | 0.926 | 158 / 43 |
+| K=100 layer, prob ≥ 0.95 | 0.9530 | +0.0005 ± 0.0001 | 0.9400 | 0.9616 | 0.926 | 126 / 31 |
+
+Decision: **not adopted.**
+- The best gain (+0.0005) is below the ~0.001 training-noise floor.
+- Singletons dip slightly.
+- It needs a K=100 run on test, roughly twice the K=50 cost.
+
+Hybrid50 stays the candidate set.
+
 ### S1-level no-match gate (negative result, not adopted)
 
 The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
