@@ -200,6 +200,31 @@ and about 0.9 GB once, independent of K. The real 5k-S1 smoke run peaks at 4.6 G
 in-memory reference. Group D is not used. Ownership features (family B) were
 not built, because the error analysis showed the development sample cannot train them.
 
+### S1-level no-match gate (negative result, not adopted)
+
+The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
+probabilities and their gap, how many candidates clear 0.3/0.5/0.7/0.9, and the best block score, name and
+address evidence.
+- **Training:** out of fold, with the pair model's S1 folds.
+- **Use:** applied after exclusivity plus threshold, suppressing all matches of S1 it calls "no match".
+- **Tuning:** its threshold is tuned on the out-of-fold gate probabilities.
+
+Reproduce: `python -m src.matching.s1_gate --cands output/candidates_p3/k20 --seeds 0 1`.
+
+| Configuration | macro-F0.5 | Δ | Singletons empty | Matched-S1 F0.5 | India | US | S1 suppressed (true singletons / matched) |
+|---|---|---|---|---|---|---|---|
+| pair model (A+C+E), threshold 0.70 | 0.9494 | – | 0.929 | 0.9506 | 0.9335 | 0.9601 | – |
+| + gate, seed 0 (gate threshold 0.68) | 0.9495 | +0.0001 ± 0.0001 | 0.930 | 0.9506 | 0.9335 | 0.9602 | 1 (1 / 0) |
+| + gate, seed 1 (gate threshold 0.68) | 0.9495 | +0.0001 ± 0.0001 | 0.931 | 0.9505 | 0.9335 | 0.9602 | 3 (2 / 1) |
+
+Why it cannot help:
+- After the targeted features, only 101 of the 27,375 S1 that output a match are true singletons (0.37%).
+- The gate ranks them well (AUC 0.968), but its precision is at most about 0.37.
+- Suppressing a matched S1 costs about 0.95 while suppressing a singleton gains 1.0, so the break-even precision is
+  about 0.49.
+
+The remaining singleton errors look like matched S1 at the entity level too.
+
 ### Hard-negative weighting (negative result, not adopted)
 
 The experiment up-weights the training negatives the blocker ranks 1–3 (21,631 pairs, about 47% of FPs). Everything else is held fixed: the same 47 features, the same 5 GroupKFold folds, and a threshold retuned per configuration on its own OOF predictions. Scores are on the 19,819 random development S1; the final holdout was not used.

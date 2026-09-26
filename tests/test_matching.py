@@ -183,6 +183,43 @@ class EntityF05Tests(unittest.TestCase):
         self.assertAlmostEqual(np.mean([entity_f05(pred[s], truth[s]) for s in truth]), macro_f05(pred, truth))
 
 
+class S1GateTests(unittest.TestCase):
+    def frames(self):
+        pairs = pd.DataFrame({"s1_id": ["S1-a", "S1-a", "S1-b", "S1-c"], "cand_id": ["S2-x", "S3-y", "S2-z", "S3-w"],
+                              "rank": [1, 2, 1, 1], "block_score": [9.0, 3.0, 5.0, 1.0],
+                              "name_score": [4.0, 1.0, 2.0, 0.5]})
+        X = pd.DataFrame({"name_tsort": [0.9, 0.2, 0.8, 0.1], "addr_tsort": [0.8, 0.9, 0.3, 0.2],
+                          "core_tsort": [0.9, 0.2, 0.8, 0.1], "num_conflict": [0, 1, 0, 0],
+                          "first_num_eq": [1, 0, -1, -1], "addr_missing": [0, 0, 1, 1]})
+        return pairs, X
+
+    def test_s1_features(self):
+        from src.matching.s1_gate import s1_features
+        pairs, X = self.frames()
+        F = s1_features(pairs, np.array([0.95, 0.4, 0.7, 0.1]), X)
+        self.assertEqual(sorted(F.index), ["S1-a", "S1-b", "S1-c"])
+        a = F.loc["S1-a"]
+        self.assertAlmostEqual(float(a["p1"]), 0.95, places=6)
+        self.assertAlmostEqual(float(a["p2"]), 0.4, places=6)
+        self.assertEqual((a["n_above_0.3"], a["n_above_0.9"], a["n_cands"]), (2, 1, 2))
+        self.assertEqual(float(a["top_block_score"]), 9.0)  # evidence of the most probable candidate
+        self.assertEqual(float(F.loc["S1-c", "p2"]), 0.0)  # single candidate
+
+    def test_apply_gate_and_metrics(self):
+        from src.matching.s1_gate import apply_gate, gate_metrics
+        truth = {"S1-a": {"S2-x"}, "S1-b": set(), "S1-c": set()}
+        pred = {"S1-a": {"S2-x"}, "S1-b": {"S2-z"}, "S1-c": set()}
+        s1 = pd.DataFrame({"entity_id": ["S1-a", "S1-b", "S1-c"], "country": ["US", "India", "US"], "city": ""})
+        gated = apply_gate(pred, {"S1-b"})
+        self.assertEqual(gated["S1-b"], set())
+        m, per = gate_metrics(gated, truth, s1, {"S1-b"})
+        self.assertEqual(m["f05"], 1.0)
+        self.assertEqual((m["suppressed"], m["suppressed_true_singletons"], m["suppressed_matched"]), (1, 1, 0))
+        m0, _ = gate_metrics(pred, truth, s1, set())
+        self.assertAlmostEqual(m0["f05"], 2 / 3)
+        self.assertEqual(m0["singleton_empty"], 0.5)
+
+
 class TopKGuardTests(unittest.TestCase):
     def test_k_mismatch_is_refused(self):
         check_top_k(20, 20)
