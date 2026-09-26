@@ -117,16 +117,32 @@ def write_matches(path, winners, threshold, cand_ids, s1_ids, s1_rank, col="matc
     """matching_results.tsv: one row per S1 in the given (file) order, accepted candidates sorted and comma-joined.
     Same bytes as matcher.write_matching_results(to_matches(...)). Returns the number of S1 with a match."""
     acc = winners.accepted(threshold)
-    owner, cids = winners.s1[acc], np.asarray(np.asarray(cand_ids, dtype=object)[acc], dtype=str)
-    o = np.lexsort((cids, owner))
-    owner, cids = owner[o], cids[o]
+    return write_assignments(path, winners.s1[acc], np.asarray(cand_ids, dtype=object)[acc], s1_ids, s1_rank, col)
+
+
+class Assignments:
+    """Accepted (S1 rank, candidate id) pairs, looked up per S1 in sorted candidate order."""
+
+    def __init__(self, owner_rank, cand_ids):
+        owner, cids = np.asarray(owner_rank, dtype=np.int64), np.asarray(cand_ids, dtype=str)
+        o = np.lexsort((cids, owner))
+        self.owner, self.cids = owner[o], cids[o]
+
+    def of(self, s1_rank):
+        a, b = np.searchsorted(self.owner, s1_rank, "left"), np.searchsorted(self.owner, s1_rank, "right")
+        return self.cids[a:b]
+
+
+def write_assignments(path, owner_rank, cand_ids, s1_ids, s1_rank, col="matched_entity_ids"):
+    """write_matches() for explicit (owner S1 rank, candidate id) arrays. Returns the number of S1 with a match."""
+    acc = Assignments(owner_rank, cand_ids)
     n_matched = 0
     with open(path, "w", encoding="utf-8", newline="") as fh:
         fh.write(f"source1_entity_id\t{col}\n")
         for s, r in zip(s1_ids, s1_rank):
-            a, b = np.searchsorted(owner, r, "left"), np.searchsorted(owner, r, "right")
-            n_matched += b > a
-            fh.write(f"{s}\t{','.join(cids[a:b])}\n")
+            ids = acc.of(r)
+            n_matched += len(ids) > 0
+            fh.write(f"{s}\t{','.join(ids)}\n")
     return n_matched
 
 
@@ -134,9 +150,16 @@ def _cross_scores(model, pairs, records):
     return {c: np.asarray(v) for c, v in xscores(pairs, records, model["tfidf"]).items()}
 
 
-def _probabilities(model, pairs, records, xt, name_stats):
+def _probabilities(model, pairs, records, xt, name_stats, rows=None):
+    """Model probabilities of the shard's pairs, or of the ``rows`` subset (boolean mask). Features are built on the
+    whole shard (within-S1 ranks and gaps see every candidate) and only then subset, so a row gets the same
+    probability either way."""
     groups = tuple(model.get("feature_groups", ()))
     X = build_features(pairs, records, model["tfidf"], xt, groups, name_stats)[model["features"]]
+    if rows is not None:
+        X = X[np.asarray(rows, dtype=bool)]
+    if not len(X):
+        return np.zeros(0, dtype=np.float32)
     return model["model"].predict_proba(X)[:, 1].astype(np.float32)
 
 
@@ -157,8 +180,8 @@ def _pass1_task(args):
 
 
 def _pass2_task(args):
-    pairs, records, xt = args
-    return _probabilities(_W["model"], pairs, records, xt, _W["name_stats"])
+    pairs, records, xt, rows = args
+    return _probabilities(_W["model"], pairs, records, xt, _W["name_stats"], rows)
 
 
 def _ordered(executor, fn, tasks, window):
@@ -174,21 +197,35 @@ def _ordered(executor, fn, tasks, window):
         yield meta0, fut.result()
 
 
-def stream_predict(store, model, out_path, s1_limit=None, log=print, workers=1):
-    """Pass 1 + pass 2 + emit over a CandidateStore with a matcher.pkl dict (model, threshold, features, tfidf).
-
-    workers > 1 scores shards in that many processes. The parent keeps the source tables and all global state
-    (TopTwo, Winners) and consumes results strictly in shard order, so the output is byte-identical to workers=1.
-    Workers receive only each shard's compact pairs / records frames, so they never load the source tables."""
-    tables = store.source_tables()
-    index = CandidateIndex(len(tables[2]), len(tables[3]))
+def split_ids(tables):
+    """(candidate id per CandidateIndex key, S1 ids in file order, S1 exclusivity ranks) of a split's source tables."""
     cand_ids = np.concatenate([tables[2]["entity_id"].to_numpy(dtype=object),
                                tables[3]["entity_id"].to_numpy(dtype=object)])
     s1_all = tables[1]["entity_id"].to_numpy(dtype=object)
-    rank = s1_ranks(s1_all)
-    n_shards = len(store.shard_paths)
+    return cand_ids, s1_all, s1_ranks(s1_all)
+
+
+def stream_winners(store, model, log=print, workers=1, select=None, name_stats=None):
+    """Pass 1 + pass 2 over a CandidateStore with a matcher.pkl dict -> (Winners, number of pairs, number scored).
+
+    select: optional callable(shard_path, frame) -> boolean mask of the shard rows that are scored and compete for
+    candidates. Every row still feeds pass 1 and the within-S1 features, so a selected row gets the same probability
+    as when the whole shard is scored. Exclusivity ties keep the global row number (shard order, then row order).
+    name_stats: precomputed NameStats of this split (computed here when the model needs feature group E).
+
+    workers > 1 scores shards in that many processes. The parent keeps the source tables and all global state
+    (TopTwo, Winners) and consumes results strictly in shard order, so the result is identical to workers=1.
+    Workers receive only each shard's compact pairs / records frames, so they never load the source tables."""
+    tables = store.source_tables()
+    index = CandidateIndex(len(tables[2]), len(tables[3]))
+    rank = s1_ranks(tables[1]["entity_id"].to_numpy(dtype=object))
+    paths = store.shard_paths
+    n_shards = len(paths)
     groups = tuple(model.get("feature_groups", ()))
-    name_stats = NameStats.from_tables(tables) if "E" in groups else None  # this split's own statistics
+    if "E" in groups and name_stats is None:
+        name_stats = NameStats.from_tables(tables)  # this split's own statistics
+    if "E" not in groups:
+        name_stats = None
 
     executor, ns_path = None, None
     if workers > 1:
@@ -217,20 +254,26 @@ def stream_predict(store, model, out_path, s1_limit=None, log=print, workers=1):
                 log(f"  pass 1: shard {i}/{n_shards}")
 
         def pass2_tasks():
-            for df in store.iter_frames(with_records=True):
+            for path, df in zip(paths, store.iter_frames(with_records=True)):
                 keys = index.keys(df["candidate_source"], df["candidate_row"])
+                rows = None if select is None else np.asarray(select(path, df), dtype=bool)
                 pairs, records = from_store(df)
                 xt = {c: t.frame(keys, pairs["cand_id"]) for c, t in tops.items()}
-                yield (keys, rank[df["s1_row"].to_numpy()]), (pairs, records, xt)
+                yield (keys, rank[df["s1_row"].to_numpy()], rows), (pairs, records, xt, rows)
 
         if executor is None:
-            results2 = ((meta, _probabilities(model, pr, rec, xt, name_stats)) for meta, (pr, rec, xt) in pass2_tasks())
+            results2 = ((meta, _probabilities(model, pr, rec, xt, name_stats, rows))
+                        for meta, (pr, rec, xt, rows) in pass2_tasks())
         else:
             results2 = _ordered(executor, _pass2_task, pass2_tasks(), window)
-        winners, row0 = Winners(index.n), 0
-        for i, ((keys, s1_rank_rows), prob) in enumerate(results2):
-            winners.update(keys, prob, s1_rank_rows, row0 + np.arange(len(keys)))
-            row0 += len(keys)
+        winners, row0, n_scored = Winners(index.n), 0, 0
+        for i, ((keys, s1_rank_rows, rows), prob) in enumerate(results2):
+            at = row0 + np.arange(len(keys))
+            if rows is not None:
+                keys, s1_rank_rows, at = keys[rows], s1_rank_rows[rows], at[rows]
+            winners.update(keys, prob, s1_rank_rows, at)
+            row0 += len(rows) if rows is not None else len(at)
+            n_scored += len(keys)
             if i % 100 == 0:
                 log(f"  pass 2: shard {i}/{n_shards}")
     finally:
@@ -238,7 +281,13 @@ def stream_predict(store, model, out_path, s1_limit=None, log=print, workers=1):
             executor.shutdown()
         if ns_path:
             os.remove(ns_path)
+    return winners, row0, n_scored
 
+
+def stream_predict(store, model, out_path, s1_limit=None, log=print, workers=1):
+    """stream_winners() + emit: matching_results.tsv of one candidate run (exclusivity + the model's threshold)."""
+    winners, n_pairs, _ = stream_winners(store, model, log, workers)
+    cand_ids, s1_all, rank = split_ids(store.source_tables())
     n = s1_limit or len(s1_all)
     n_matched = write_matches(out_path, winners, model["threshold"], cand_ids, s1_all[:n], rank[:n])
-    return {"pairs": row0, "s1": n, "s1_matched": int(n_matched)}
+    return {"pairs": n_pairs, "s1": n, "s1_matched": int(n_matched)}

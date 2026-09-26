@@ -52,7 +52,9 @@ def load_ground_truth_pairs(data_dir="data/raw/train"):
 
 
 class CandidateStore:
-    def __init__(self, split, out_dir="output/candidates", data_dir=None):
+    def __init__(self, split, out_dir="output/candidates", data_dir=None, tables=None):
+        """tables: the already-loaded source_tables() of another store of the same split and data_dir, shared
+        instead of loaded again (1-2 GB for a full split) when two candidate runs are read together."""
         self.split = split
         self.run_dir = os.path.join(out_dir, split)
         self.data_dir = data_dir or os.path.join("data", "raw", split)
@@ -62,7 +64,7 @@ class CandidateStore:
                                     f"python -m src.blocking.generate_candidates --split {split}")
         with open(meta, encoding="utf-8") as f:
             self.meta = json.load(f)
-        self._tables = None
+        self._tables = tables
 
     @property
     def shard_paths(self):

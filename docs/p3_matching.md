@@ -7,13 +7,14 @@ Code: `src/matching/matcher.py` (features, model, decision rule, metric), `src/m
 **From P2 (blocking):** `src.blocking.handoff.CandidateStore` frames (`iter_frames(with_records=True)`, plus `with_labels=True` on train). `matcher.from_store()` turns a frame into the matcher's `pairs` (`s1_id`, `cand_id`, `block_score` = P2's `score`, `rank`, `name_score`) and `records` (`entity_id`, `business_name`, `business_address`, `country`). The store keeps `"NULL"`/`"nan"` as text. `from_store` maps them to missing values.
 - **Train:** `python -m src.matching.sample_candidates --top-k K` runs P2's engine with P2's default config, but only on the P3 training sample. It writes a `CandidateStore("train", out_dir="output/candidates_p3/kK")`. P2's blocker scores every S1 independently (output does not depend on shard size, blocking_data_analysis.md §10.6), so these are exactly the pairs the full `generate_candidates --split train` run gives the same S1. Pair recall on the sample at K=100 is 97.01%; P2 measured 97.05%.
 - **Test:** `python -m src.blocking.generate_candidates --split test --top-k K` → `output/candidates/test` and the official `output/candidate_pairs.tsv`. **K must equal the model's K.** `predict.py` refuses to run otherwise, because the rank, gap and cross-entity features depend on the length of the candidate list.
+- **Test, adopted Hybrid50:** a K=20 and a K=50 run (`--no-tsv`, separate `--out-dir`), then `python -m src.pipeline.predict_hybrid`, which writes both official files (see "Production Hybrid50 inference").
 
 **From P1 (cleaning):** records with cleaned `business_name` / `business_address` can replace the ones `from_store` builds. `country` stays the raw label (France is unseen in train, and nothing one-hots it).
 
 **To P4 (evaluation and submission):**
 - `output/candidates_p3/kK/oof.parquet`: `s1_id`, `cand_id`, `rank`, `label`, `prob` (out-of-fold, GroupKFold by S1).
 - `src.matching.matcher.macro_f05(pred, truth)`, where both arguments are `{s1_id: set(ids)}` and `truth` covers every S1 (empty set = singleton). **Import it, don't reimplement it**, so every number in the report comes from the same metric.
-- `output/matching_results.tsv` from `src.matching.predict`. Every match is in P2's candidate list, and each S2/S3 record is used at most once. `output/candidate_pairs.tsv` is P2's file.
+- `output/matching_results.tsv` and `output/candidate_pairs.tsv` from `src.pipeline.predict_hybrid` (adopted Hybrid50), or `matching_results.tsv` from `src.matching.predict` with P2's own `candidate_pairs.tsv` (single K). Either way every match is in the candidate list, and each S2/S3 record is used at most once.
 
 **Retrain rule:** the features (rank, gap, cross-entity, P2 scores), the TF-IDF vocabulary and the threshold all depend on the candidate distribution (including K) and on the text. Whenever P2's blocking, K or P1's cleaning changes, re-run `sample_candidates` + `train` and use the new `matcher.pkl` (model, threshold, TF-IDF, K). Never reuse a `matcher.pkl` across pipeline versions.
 
@@ -299,7 +300,7 @@ Results on the random development S1:
 - **Singletons drop slightly** (0.929 → 0.927), because 2 random-sample singletons receive a deep match. Matched S1
   gain more than that.
 
-Production implications, if adopted:
+Production implications (implemented in `src/pipeline/predict_hybrid.py`, see "Production Hybrid50 inference"):
 - Test inference needs both the K=20 run (base decisions) and a K=50 run for the deep probabilities.
 - `candidate_pairs.tsv` must list the HYBRID set (`src/pipeline/hybrid.py`), since every predicted match must be a
   candidate.
@@ -430,13 +431,66 @@ Measured on real test S1 (K=20). Every output is byte-identical to the single-wo
   (34.7M pairs) about 0.9 h with 2 workers, versus about 3.4 h before; K=50 (86.6M pairs) about 2.1 h with 2
   workers.
 
+### Production Hybrid50 inference
+
+`src/pipeline/predict_hybrid.py` is the test-time implementation of the adopted system. It needs two P2 runs over the
+same S1 and shard plan (only `--top-k` differs):
+1. **Base.** The improved K=20 matcher streams the exact K=20 candidates (`stream.stream_winners`): global
+   exclusivity, then its threshold (0.70). These assignments are frozen.
+2. **Deep.** The K=50 matcher streams the K=50 candidates. Every row feeds the cross-entity top-2 and the within-S1
+   features, but only the hybrid's deep rows are scored and compete: K=50 candidates that are not in the S1's exact
+   K=20 list, up to the cap of 50. A deep candidate goes to its global deep winner (highest probability, then the
+   smallest `s1_id`, then the earliest row) when that probability is ≥ 0.85 and the base did not already assign
+   the candidate.
+3. **Outputs,** one row per S1 in `test_source1` order, written in one pass:
+   - `candidate_pairs.tsv` lists the hybrid set: every exact K=20 candidate in K=20 order, then K=50-only
+     candidates in K=50 order, up to 50.
+   - `matching_results.tsv` holds the base plus deep matches, sorted. Every match is checked to be in its S1's
+     candidate list, and the run fails otherwise.
+
+The two runs share one copy of the source tables (`CandidateStore(..., tables=...)`) and one set of group E name
+statistics. Paired shards are processed one per country at a time, so memory stays bounded as in single-K
+inference.
+
+**Equivalence.** `src/pipeline/hybrid_equivalence.py` re-derives both files on real test smoke runs through an
+independent path:
+- every pair scored in memory, with the global cross-entity top-2 over the whole run;
+- then the offline functions `hybrid_candidates`, `base_predictions` and `merge_deep`.
+
+| Smoke set (first N test S1) | Pairs K=20 / K=50 | Base matches | Deep matches | `matching_results.tsv` | `candidate_pairs.tsv` | Production runtime |
+|---|---|---|---|---|---|---|
+| 5k | 100k / 250k | 16,073 | 219 | identical | identical | 152 s |
+| 50k | 1.0M / 2.5M | 160,471 | 2,324 | identical | identical | 479 s (a training job shared the CPU) |
+
+**Checks on the smoke outputs:**
+- Official validator (`--check-ids`, against a copy of `test_source1.tsv` cut to the smoke S1): **PASS**, with no
+  subset warning.
+- The base part equals the previous single-K=20 stream output exactly; the deep matches come on top.
+
+**Tests:** `tests/test_predict_hybrid.py` covers:
+- base priority, deep threshold (inclusive, float32), deep exclusivity and ties across shards;
+- random sharded equivalence with `merge_deep`;
+- K=20-only preservation and K=50-only order/cap;
+- shard pairing and file-order merging across countries;
+- an end-to-end run on two real P2 runs (K=3 base, K=6 deep, cap 5) that must be byte-identical to the offline
+  reference, and identical for 1 and 2 workers;
+- official S1 order, singleton rows, no duplicate candidates, every match among its candidates, exclusivity.
+
+Three mutations are all caught by these tests: no base priority, all K=50 rows treated as deep, and deep threshold
+ignored.
+
 ## Reproduce
 
 ```
 python -m src.matching.sample_candidates --top-k 20       # P2's blocker on the 29,169-S1 training sample (~4 min, 2 workers)
 python -m src.matching.train --cands output/candidates_p3/k20      # ~7 min; add --variants "" "^(rank|name_score)" for the ablation
 python -m src.blocking.generate_candidates --split test --top-k 20   # P2: output/candidates/test + output/candidate_pairs.tsv
-python -m src.matching.predict --model output/candidates_p3/k20/matcher.pkl   # streams shards (2 workers); memory ~flat in #pairs
+python -m src.matching.predict --model output/candidates_p3/k20/matcher.pkl   # single K: streams shards (2 workers); memory ~flat in #pairs
+# adopted Hybrid50 (needs output/candidates_p3/k50 trained with: sample_candidates --top-k 50 + train --cands .../k50):
+python -m src.blocking.generate_candidates --split test --top-k 20 --out-dir output/candidates_k20 --no-tsv
+python -m src.blocking.generate_candidates --split test --top-k 50 --out-dir output/candidates_k50 --no-tsv
+python -m src.pipeline.predict_hybrid   # -> output/matching_results.tsv + output/candidate_pairs.tsv (+ hybrid_summary.json)
+python -m src.pipeline.hybrid_equivalence --base-cands output/p3_smoke/k20_5000 --deep-cands output/p3_smoke/k50_5000   # smoke check
 python resources/utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir data/raw/test
 ```
 

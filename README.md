@@ -61,6 +61,9 @@ python resources/utils/validate_submission.py --matching output/matching_results
   candidates, and [docs/blocking_data_analysis.md](docs/blocking_data_analysis.md) for the analysis
   and measured results.
 - Matching (`src/matching`): implemented. See [docs/p3_matching.md](docs/p3_matching.md).
+- Production inference of the adopted Hybrid50 system (`src/pipeline/predict_hybrid.py`): K=20 base decisions plus
+  confident deep K=50 matches, writing both official files. See "Production Hybrid50 inference" in
+  [docs/p3_matching.md](docs/p3_matching.md).
 - Evaluation and final pipeline: not implemented yet.
 
 Run the tests with `python -m unittest discover -s tests -t .`
