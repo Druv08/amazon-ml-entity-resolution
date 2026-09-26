@@ -387,13 +387,56 @@ Reproduce: `python -m src.matching.hard_negatives --cands output/candidates_p3/k
 - **Decision:** production training stays unweighted (`train()` defaults to `sample_weight=None`). The experiment
   script is kept for later feature work on the same FP groups.
 
+### Inference performance (streaming, identical output)
+
+**Profile** of the single-process path on 5k real test S1 (100k pairs, A+C+E model):
+
+| Cost | Time (profiled) | Notes |
+|---|---|---|
+| group E name statistics | ~112 s unprofiled | once per run, independent of K |
+| `build_features` | 45 s | per pair; biggest parts: transliteration group C 17 s, TF-IDF 12 s, group A 4.5 s, group E 2.9 s |
+| `predict_proba` | 2.3 s | |
+| RapidFuzz | 0.5 s | |
+| global winner reduction | ~0 s | |
+| shard reads | ~1.8 s per shard | a bug, now fixed (see below) |
+
+**The shard-read bug.** P2's `CandidateStore.iter_frames` converted each whole multi-million-row S2/S3 column to
+NumPy for every shard, then picked the shard's rows. It now takes the rows first (`Series.take`), with identical
+values.
+
+**Parallel scoring.** `stream_predict(..., workers=N)` / `predict.py --workers N` scores shards in N spawn-safe
+processes:
+- **Worker inputs:** each worker gets only the shard's compact pairs/records, the model, and (group E) the name
+  statistics, via a temp file. Workers never load the source tables.
+- **Bounded memory:** at most 2N shards are in flight.
+- **Deterministic reduction:** the parent consumes results strictly in shard order, so global top-2, exclusivity,
+  tie-breaks and output are unchanged.
+- **Tested:** synthetic multi-shard equivalence (with and without A+C+E) in `tests/test_inference.py`.
+
+Measured on real test S1 (K=20). Every output is byte-identical to the single-worker streaming output:
+
+| Configuration | 5k S1 (100k pairs) | 50k S1 (1.0M pairs) | Speedup (50k) | Peak RAM, process tree (50k) | Pairs/s (50k) |
+|---|---|---|---|---|---|
+| before (legacy shard read), 1 worker | 192 s | 483.1 s | 1.00× | 4.7 GB | 2,070 |
+| shard-read fix, 1 worker | 138.9 s | 305.4 s | 1.58× | 4.5 GB | 3,275 |
+| **shard-read fix, 2 workers (CLI default)** | 133.1 s | **220.6 s** | **2.19×** | **6.7 GB** | 4,533 |
+| shard-read fix, 4 workers | 131.8 s | 214.0 s | 2.26× | 8.8 GB | 4,673 |
+
+- **Fixed cost:** about 132 s of each run is fixed (name statistics plus source tables), which is why 5k barely
+  changes.
+- **Per-pair cost:** 351 s (before) → 173 s (fix) → 89 s (2 workers) → 82 s (4 workers) per 1M pairs. A fourth worker
+  adds 3% for about +2.1 GB, because the parent's sequential shard reads and joins become the limit.
+- **Full-test estimates** (extrapolated from the 50k measurements plus the fixed cost, not measured): K=20
+  (34.7M pairs) about 0.9 h with 2 workers, versus about 3.4 h before; K=50 (86.6M pairs) about 2.1 h with 2
+  workers.
+
 ## Reproduce
 
 ```
 python -m src.matching.sample_candidates --top-k 20       # P2's blocker on the 29,169-S1 training sample (~4 min, 2 workers)
 python -m src.matching.train --cands output/candidates_p3/k20      # ~7 min; add --variants "" "^(rank|name_score)" for the ablation
 python -m src.blocking.generate_candidates --split test --top-k 20   # P2: output/candidates/test + output/candidate_pairs.tsv
-python -m src.matching.predict --model output/candidates_p3/k20/matcher.pkl   # streams shards; memory ~flat in #pairs
+python -m src.matching.predict --model output/candidates_p3/k20/matcher.pkl   # streams shards (2 workers); memory ~flat in #pairs
 python resources/utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir data/raw/test
 ```
 

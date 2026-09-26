@@ -23,6 +23,9 @@ if __name__ == "__main__":
     ap.add_argument("--split", default="test")
     ap.add_argument("--cands", default="output/candidates", help="out_dir of generate_candidates")
     ap.add_argument("--out", default="output")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="scoring processes; output is byte-identical for any value. 2 is the measured best "
+                         "trade-off (docs/p3_matching.md 'Inference performance'); each extra worker costs ~1 GB")
     a = ap.parse_args()
     t0 = time.time()
 
@@ -32,7 +35,7 @@ if __name__ == "__main__":
     check_top_k(m["top_k"], store.meta["config"]["top_k"], a.split)
     os.makedirs(a.out, exist_ok=True)
     path = f"{a.out}/matching_results.tsv"
-    r = stream_predict(store, m, path, s1_limit=store.meta["s1_limit"],
+    r = stream_predict(store, m, path, s1_limit=store.meta["s1_limit"], workers=a.workers,
                        log=lambda msg: print(f"{msg}, {time.time() - t0:.0f}s", flush=True))
     print(f"wrote {path} in {time.time() - t0:.0f}s | {r['pairs']} pairs | S1 with a match: "
           f"{r['s1_matched'] / max(r['s1'], 1):.3f}")

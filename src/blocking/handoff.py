@@ -96,7 +96,9 @@ class CandidateStore:
                     out = np.empty(len(df), dtype=object)
                     for s in (2, 3):
                         m = (df["candidate_source"] == s).to_numpy()
-                        out[m] = tables[s][src_col].to_numpy()[df.loc[m, "candidate_row"].to_numpy()]
+                        # take the shard's rows first: converting the whole multi-million-row column per shard
+                        # made every shard read cost ~2 s regardless of its size
+                        out[m] = tables[s][src_col].take(df.loc[m, "candidate_row"].to_numpy()).to_numpy()
                     df[col] = out
             if truth is not None:
                 df["label"] = [int((a, b) in truth) for a, b in zip(df["s1_entity_id"], df["candidate_entity_id"])]

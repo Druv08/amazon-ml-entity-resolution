@@ -241,6 +241,18 @@ class EndToEndTests(unittest.TestCase):
         stream_predict(self.store, m, got, log=lambda *a: None)
         self.assertEqual(read(got), read(ref))
 
+    def test_parallel_workers_give_identical_output(self):
+        ns = NameStats.from_tables(self.store.source_tables())
+        frame = pd.concat(self.store.iter_frames(with_records=True), ignore_index=True)
+        pairs, records = from_store(frame)
+        feats = list(build_features(pairs, records, self.model["tfidf"], None, ("A", "C", "E"), ns).columns)
+        for m in (self.model, dict(self.model, features=feats, feature_groups=("A", "C", "E"))):
+            one, two = os.path.join(self.tmp, "w1.tsv"), os.path.join(self.tmp, "w2.tsv")
+            r1 = stream_predict(self.store, m, one, log=lambda *a: None, workers=1)
+            r2 = stream_predict(self.store, m, two, log=lambda *a: None, workers=2)
+            self.assertEqual(read(one), read(two))
+            self.assertEqual(r1, r2)
+
     def test_output_is_exclusive_subset_in_file_order(self):
         got = os.path.join(self.tmp, "got2.tsv")
         stream_predict(self.store, self.model, got, log=lambda *a: None)

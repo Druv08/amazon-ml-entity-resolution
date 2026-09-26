@@ -12,6 +12,12 @@ are built. Exclusivity ties are resolved exactly as matcher.exclusive(): highest
 earliest row (shard order, then row order within the shard).
 """
 
+import os
+import pickle
+import tempfile
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 import pandas as pd
 
@@ -124,8 +130,56 @@ def write_matches(path, winners, threshold, cand_ids, s1_ids, s1_rank, col="matc
     return n_matched
 
 
-def stream_predict(store, model, out_path, s1_limit=None, log=print):
-    """Pass 1 + pass 2 + emit over a CandidateStore with a matcher.pkl dict (model, threshold, features, tfidf)."""
+def _cross_scores(model, pairs, records):
+    return {c: np.asarray(v) for c, v in xscores(pairs, records, model["tfidf"]).items()}
+
+
+def _probabilities(model, pairs, records, xt, name_stats):
+    groups = tuple(model.get("feature_groups", ()))
+    X = build_features(pairs, records, model["tfidf"], xt, groups, name_stats)[model["features"]]
+    return model["model"].predict_proba(X)[:, 1].astype(np.float32)
+
+
+# ---------------------------------------------------------------- worker processes (spawn-safe, module level)
+_W = {}
+
+
+def _init_worker(model, name_stats_path):
+    _W["model"] = model
+    _W["name_stats"] = None
+    if name_stats_path:
+        with open(name_stats_path, "rb") as fh:
+            _W["name_stats"] = pickle.load(fh)
+
+
+def _pass1_task(args):
+    return _cross_scores(_W["model"], *args)
+
+
+def _pass2_task(args):
+    pairs, records, xt = args
+    return _probabilities(_W["model"], pairs, records, xt, _W["name_stats"])
+
+
+def _ordered(executor, fn, tasks, window):
+    """(meta, result) in task order with at most ``window`` tasks in flight (bounded memory, deterministic order)."""
+    queue = deque()
+    for meta, args in tasks:
+        queue.append((meta, executor.submit(fn, args)))
+        if len(queue) >= window:
+            meta0, fut = queue.popleft()
+            yield meta0, fut.result()
+    while queue:
+        meta0, fut = queue.popleft()
+        yield meta0, fut.result()
+
+
+def stream_predict(store, model, out_path, s1_limit=None, log=print, workers=1):
+    """Pass 1 + pass 2 + emit over a CandidateStore with a matcher.pkl dict (model, threshold, features, tfidf).
+
+    workers > 1 scores shards in that many processes. The parent keeps the source tables and all global state
+    (TopTwo, Winners) and consumes results strictly in shard order, so the output is byte-identical to workers=1.
+    Workers receive only each shard's compact pairs / records frames, so they never load the source tables."""
     tables = store.source_tables()
     index = CandidateIndex(len(tables[2]), len(tables[3]))
     cand_ids = np.concatenate([tables[2]["entity_id"].to_numpy(dtype=object),
@@ -136,30 +190,55 @@ def stream_predict(store, model, out_path, s1_limit=None, log=print):
     groups = tuple(model.get("feature_groups", ()))
     name_stats = NameStats.from_tables(tables) if "E" in groups else None  # this split's own statistics
 
-    tops = {}
-    for i, df in enumerate(store.iter_frames(with_records=True)):
-        keys = index.keys(df["candidate_source"], df["candidate_row"])
-        for c, v in xscores(*from_store(df), model["tfidf"]).items():
-            v = np.asarray(v)
-            if c not in tops:
-                tops[c] = TopTwo(index.n, v.dtype if v.dtype.kind == "f" else np.float64)
-            tops[c].update(keys, v)  # raises if a shard's dtype differs (values must stay exact)
-        if i % 100 == 0:
-            log(f"  pass 1: shard {i}/{n_shards}")
+    executor, ns_path = None, None
+    if workers > 1:
+        if name_stats is not None:
+            fd, ns_path = tempfile.mkstemp(suffix=".pkl", prefix="namestats_")
+            with os.fdopen(fd, "wb") as fh:
+                pickle.dump(name_stats, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        executor = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(model, ns_path))
+    window = 2 * workers
+    try:
+        def pass1_tasks():
+            for df in store.iter_frames(with_records=True):
+                yield index.keys(df["candidate_source"], df["candidate_row"]), from_store(df)
 
-    winners, row0, n_pairs = Winners(index.n), 0, 0
-    for i, df in enumerate(store.iter_frames(with_records=True)):
-        keys = index.keys(df["candidate_source"], df["candidate_row"])
-        pairs, records = from_store(df)
-        xt = {c: t.frame(keys, pairs["cand_id"]) for c, t in tops.items()}
-        X = build_features(pairs, records, model["tfidf"], xt, groups, name_stats)[model["features"]]
-        prob = model["model"].predict_proba(X)[:, 1].astype(np.float32)
-        winners.update(keys, prob, rank[df["s1_row"].to_numpy()], row0 + np.arange(len(df)))
-        row0 += len(df)
-        n_pairs += len(df)
-        if i % 100 == 0:
-            log(f"  pass 2: shard {i}/{n_shards}")
+        if executor is None:
+            results1 = ((keys, _cross_scores(model, *pr)) for keys, pr in pass1_tasks())
+        else:
+            results1 = _ordered(executor, _pass1_task, pass1_tasks(), window)
+        tops = {}
+        for i, (keys, scores) in enumerate(results1):
+            for c, v in scores.items():
+                if c not in tops:
+                    tops[c] = TopTwo(index.n, v.dtype if v.dtype.kind == "f" else np.float64)
+                tops[c].update(keys, v)  # raises if a shard's dtype differs (values must stay exact)
+            if i % 100 == 0:
+                log(f"  pass 1: shard {i}/{n_shards}")
+
+        def pass2_tasks():
+            for df in store.iter_frames(with_records=True):
+                keys = index.keys(df["candidate_source"], df["candidate_row"])
+                pairs, records = from_store(df)
+                xt = {c: t.frame(keys, pairs["cand_id"]) for c, t in tops.items()}
+                yield (keys, rank[df["s1_row"].to_numpy()]), (pairs, records, xt)
+
+        if executor is None:
+            results2 = ((meta, _probabilities(model, pr, rec, xt, name_stats)) for meta, (pr, rec, xt) in pass2_tasks())
+        else:
+            results2 = _ordered(executor, _pass2_task, pass2_tasks(), window)
+        winners, row0 = Winners(index.n), 0
+        for i, ((keys, s1_rank_rows), prob) in enumerate(results2):
+            winners.update(keys, prob, s1_rank_rows, row0 + np.arange(len(keys)))
+            row0 += len(keys)
+            if i % 100 == 0:
+                log(f"  pass 2: shard {i}/{n_shards}")
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        if ns_path:
+            os.remove(ns_path)
 
     n = s1_limit or len(s1_all)
     n_matched = write_matches(out_path, winners, model["threshold"], cand_ids, s1_all[:n], rank[:n])
-    return {"pairs": n_pairs, "s1": n, "s1_matched": int(n_matched)}
+    return {"pairs": row0, "s1": n, "s1_matched": int(n_matched)}
