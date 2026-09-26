@@ -125,6 +125,33 @@ All three help, most in India: 0.9048 → 0.9224 at K=20.
 - A third of FPs are records that truly belong to a different S1. These are the same brand at another branch, or a different business at the same address. At test time exclusivity can drop them when the true owner scores higher.
 - The remaining gap to the ceiling is 0.041. India's per-S1 gap is larger (0.048, vs 0.036 in the US), but the US has more S1, so both countries lose about the same total.
 
+### Error analysis (K=20 OOF, development sample)
+
+Reproduce: `python -m src.evaluation.matcher_errors --cands output/candidates_p3/k20`. It uses the production rule
+(exclusivity plus threshold 0.65) and writes aggregate tables to `output/error_analysis/` (git-ignored, no raw
+records).
+
+Over 583,363 pairs and 29,169 S1:
+
+| Outcome | Pairs |
+|---|---|
+| TP | 90,440 |
+| FP | 1,895 |
+| FN1: not among the K candidates | 5,200 |
+| FN2: below threshold | 5,789 |
+| FN3: lost to exclusivity | 5 |
+
+152 of the 1,598 singleton S1 get at least one match.
+
+| Finding | Evidence |
+|---|---|
+| Rank 1–3 FPs are mostly *same address, different business* | 885 FPs (47%). Acceptance among negatives: 7.2% at rank 1, 4.6% at rank 2, 2.9% at rank 3 (0.39% overall). These FPs have high address similarity (addr_tsort 0.84–0.89) but lower name similarity (0.63–0.67). 46% of all FPs share the first house number. |
+| House-number disagreement costs recall | 39% of true pairs with fully conflicting numbers are missed, and 21% of those whose first numbers differ (6% overall). These pairs still have high name (0.78) and address (0.82) similarity, which points to typos in numbers. |
+| Name-only candidates are ambiguous | Candidates without an address produce 327 FPs (near-identical names, often another branch of a chain). 40% of true name-only candidates are missed (1,200 FN2). |
+| Indian-script candidates | 12% of FPs and 10% of FN2. Name similarity for them is about 0.12–0.16, because the matcher cannot compare scripts. FN2 rate for these true pairs is 8.5% (6.0% overall). |
+| Claimed by another S1 | 33% of FPs, but the owner S1 is in the development sample for only 2.1% of them. Development data cannot teach cross-S1 ownership features; exclusivity handles it once every S1 is scored. |
+| Blocking loss | 5,200 true pairs (5.1%) are not among the K=20 candidates; 63% of them are India. |
+
 ### Hard-negative weighting (negative result, not adopted)
 
 The experiment up-weights the training negatives the blocker ranks 1–3 (21,631 pairs, about 47% of FPs). Everything else is held fixed: the same 47 features, the same 5 GroupKFold folds, and a threshold retuned per configuration on its own OOF predictions. Scores are on the 19,819 random development S1; the final holdout was not used.
