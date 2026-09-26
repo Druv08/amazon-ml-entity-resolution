@@ -89,5 +89,21 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(all(" | " in x["pattern"] for x in p))
 
 
+class KCompareTests(unittest.TestCase):
+    def test_run_metrics(self):
+        from src.evaluation.k_compare import run_metrics
+        truth = {"S1-a": {"S2-x", "S3-q"}, "S1-b": set(), "S1-c": {"S2-y"}}
+        s1 = pd.DataFrame({"entity_id": ["S1-a", "S1-b", "S1-c"], "country": ["India", "US", "US"], "city": ""})
+        oof = pd.DataFrame({"s1_id": ["S1-a", "S1-a", "S1-b", "S1-c"], "cand_id": ["S2-x", "S2-z", "S2-w", "S2-y"],
+                            "rank": [1, 2, 1, 3], "label": [1, 0, 0, 1], "prob": [0.9, 0.2, 0.8, 0.3]})
+        m = run_metrics(oof, 0.5, truth, s1)
+        self.assertEqual(m["pair_recall"], round(2 / 3, 4))  # S3-q was never a candidate
+        self.assertEqual((m["fp"], m["fp_rank_1_3"]), (1, 1))  # S1-b's singleton false positive
+        self.assertEqual(m["singletons_empty"], 0.0)
+        # a: P=1 R=0.5 -> 0.8333; b: 0; c: missed -> 0
+        self.assertAlmostEqual(m["f05"], round((1.25 * 0.5 / 0.75) / 3, 4), places=4)
+        self.assertAlmostEqual(m["ceiling"], round((1.25 * 0.5 / 0.75 + 1 + 1) / 3, 4), places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

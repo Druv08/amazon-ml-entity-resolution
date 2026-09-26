@@ -200,6 +200,29 @@ and about 0.9 GB once, independent of K. The real 5k-S1 smoke run peaks at 4.6 G
 in-memory reference. Group D is not used. Ownership features (family B) were
 not built, because the error analysis showed the development sample cannot train them.
 
+### K=20 vs K=50 with the improved features
+
+K=50 candidates were generated for the same 29,169 development S1 (`python -m src.matching.sample_candidates
+--top-k 50`, 94 s). The A+C+E matcher was then retrained from scratch at K=50
+(`python -m src.matching.train --cands output/candidates_p3/k50`, 621 s, versus 472 s at K=20). All three runs use
+the production rule on the 19,819 random development S1.
+Reproduce: `python -m src.evaluation.k_compare base20=output/candidates_p3/k20/oof_baseline47.parquet:0.65
+k20=output/candidates_p3/k20 k50=output/candidates_p3/k50`.
+
+| Configuration | Pair recall | Ceiling | macro-F0.5 | India | US | Singletons empty | Matched S1 | AUC | FPs | Rank 1–3 FPs | Threshold |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| old K=20 baseline (47 features) | 0.9493 | 0.9815 | 0.9407 | 0.9224 | 0.9529 | 0.895 | 0.9433 | 0.9986 | 1,895 | 885 | 0.65 |
+| improved K=20 (61 features) | 0.9493 | 0.9815 | **0.9494** | 0.9335 | 0.9601 | 0.929 | 0.9506 | 0.9991 | 1,216 | 612 | 0.70 |
+| improved K=50 (61 features) | 0.9654 | 0.9874 | 0.9492 | 0.9343 | 0.9591 | 0.918 | 0.9509 | 0.9994 | 1,435 | 664 | 0.72 |
+
+- **K=50 ties K=20:** −0.0002, inside the ~0.001 noise.
+- **The larger ceiling (+0.006) is not converted into score.** K=50 accepts 1,572 of the 2,815 new rank 21–50 true
+  pairs (55.8%) with only 140 FPs among them. But it loses 1,242 true positives and adds 79 FPs among ranks ≤ 20,
+  because the model and threshold (0.72) are stricter with 2.5× more negatives per S1.
+- **Inference cost scales with K.** Full test inference is estimated at about 5.5 h for K=20 (34.7M pairs) and
+  13.7 h for K=50 (86.6M pairs), single process. This is extrapolated from the 5k-S1 smoke run at ~0.57 ms per pair
+  plus ~2.5 min fixed, not measured.
+
 ### S1-level no-match gate (negative result, not adopted)
 
 The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
