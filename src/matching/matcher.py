@@ -229,9 +229,9 @@ def to_matches(pairs, prob, threshold, s1_ids):
     return out
 
 
-def train(X, y, **kw):
+def train(X, y, sample_weight=None, **kw):
     params = dict(max_iter=500, learning_rate=0.05, max_leaf_nodes=31, early_stopping=True, random_state=0)
-    return HistGradientBoostingClassifier(**{**params, **kw}).fit(X, y)
+    return HistGradientBoostingClassifier(**{**params, **kw}).fit(X, y, sample_weight=sample_weight)
 
 
 def best_threshold(pairs, prob, truth):

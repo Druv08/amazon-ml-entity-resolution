@@ -125,13 +125,39 @@ All three help, most in India: 0.9048 → 0.9224 at K=20.
 - A third of FPs are records that truly belong to a different S1. These are the same brand at another branch, or a different business at the same address. At test time exclusivity can drop them when the true owner scores higher.
 - The remaining gap to the ceiling is 0.041. India's per-S1 gap is larger (0.048, vs 0.036 in the US), but the US has more S1, so both countries lose about the same total.
 
+### Hard-negative weighting (negative result, not adopted)
+
+The experiment up-weights the training negatives the blocker ranks 1–3 (21,631 pairs, about 47% of FPs). Everything else is held fixed: the same 47 features, the same 5 GroupKFold folds, and a threshold retuned per configuration on its own OOF predictions. Scores are on the 19,819 random development S1; the final holdout was not used.
+
+Reproduce: `python -m src.matching.hard_negatives --cands output/candidates_p3/k20 --weights 1 1.5 2 3`
+
+| Configuration | macro-F0.5 | Δ vs control (paired, ±SE) | India | US | singletons empty | AUC | FPs | rank 1–3 FPs | lookalike FPs | claimed FPs | threshold |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| no weights (`train.py`) | 0.9407 | – | 0.9224 | 0.9529 | 0.895 | 0.9986 | – | – | – | – | 0.65 |
+| unit weights (control) | 0.9396 | 0 | 0.9216 | 0.9517 | 0.908 | 0.9986 | 1,557 | 760 | 499 | 457 | 0.71 |
+| unit weights, seed 1 | 0.9406 | +0.0009 ± 0.0004 | 0.9237 | 0.9519 | 0.912 | 0.9986 | 1,560 | 761 | 510 | 464 | 0.70 |
+| hard negatives ×1.5 | 0.9394 | −0.0002 ± 0.0004 | 0.9216 | 0.9513 | 0.904 | 0.9986 | 1,798 | 767 | 618 | 606 | 0.64 |
+| hard negatives ×2.0 | 0.9397 | +0.0001 ± 0.0004 | 0.9212 | 0.9521 | 0.910 | 0.9986 | 1,859 | 700 | 644 | 664 | 0.61 |
+| hard negatives ×3.0 | 0.9391 | −0.0006 ± 0.0005 | 0.9214 | 0.9509 | 0.913 | 0.9986 | 1,935 | 629 | 713 | 733 | 0.57 |
+
+- **Unit weights differ from no weights (0.9396 vs 0.9407), and this is expected.** With more than 200k training
+  rows, scikit-learn's histogram binning subsamples rows with `rng.choice(..., p=w/Σw)` when weights are passed and
+  `p=None` otherwise. The bin edges therefore differ: statistically equivalent, but not bit-identical.
+  - The three unweighted runs span **0.9396–0.9407**. That is the training-noise floor, about ±0.001.
+  - A different seed alone moves the score by 2.25 paired SE, so the paired SE understates the real noise.
+- **No weight improves macro-F0.5 beyond that noise.** Heavier weights do cut rank 1–3 FPs (760 → 629 at ×3).
+  But the retuned threshold drops (0.71 → 0.57), and lookalike and claimed-by-another-S1 FPs grow. Total FPs rise
+  1,557 → 1,935, singletons move by less than 0.5 pp, and there is no consistent India or US gain.
+- **Decision:** production training stays unweighted (`train()` defaults to `sample_weight=None`). The experiment
+  script is kept for later feature work on the same FP groups.
+
 ## Reproduce
 
 ```
 python -m src.matching.sample_candidates --top-k 20       # P2's blocker on the 29,169-S1 training sample (~4 min, 2 workers)
 python -m src.matching.train --cands output/candidates_p3/k20      # ~7 min; add --variants "" "^(rank|name_score)" for the ablation
 python -m src.blocking.generate_candidates --split test --top-k 20   # P2: output/candidates/test + output/candidate_pairs.tsv
-python -m src.matching.predict --model output/candidates_p3/k20/matcher.pkl
+python -m src.matching.predict --model output/candidates_p3/k20/matcher.pkl   # streams shards; memory ~flat in #pairs
 python resources/utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir data/raw/test
 ```
 

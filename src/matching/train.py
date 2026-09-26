@@ -55,14 +55,10 @@ def report(pairs, prob, truth, s1, hard):
     return r
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cands", default=f"{OUT}/k20", help="out_dir of src.matching.sample_candidates")
-    ap.add_argument("--variants", nargs="+", default=[""], help="regexes of feature columns to drop, one per variant")
-    a = ap.parse_args()
+def load(cands):
+    """-> pairs (with label), records, truth for the sampled S1, the sample frame, claimed ids, K."""
     t0 = time.time()
-
-    store = CandidateStore("train", out_dir=a.cands)
+    store = CandidateStore("train", out_dir=cands)
     pairs, records = from_store(pd.concat(store.iter_frames(with_records=True, with_labels=True), ignore_index=True))
     top_k = store.meta["config"]["top_k"]
     del store
@@ -74,17 +70,33 @@ if __name__ == "__main__":
     n_true = sum(map(len, truth.values()))
     print(f"loaded {time.time() - t0:.0f}s: {len(pairs)} pairs, {len(truth)} S1, {len(pairs) / len(truth):.1f} "
           f"cands/S1, pair recall {pairs.label.sum() / n_true:.4f}", flush=True)
+    return pairs, records, truth, s1, claimed, top_k
 
+
+def featurize(pairs, records, claimed):
+    """-> X, y, fitted tfidf and the hard-negative masks used in report()."""
     tfidf = fit_tfidf(records)
     xt = xtop(pairs, records, tfidf)  # cross-entity top-2 over the whole sample, features built per 3k-S1 chunk
     grp = pairs["s1_id"].factorize()[0] // 3000
     X = pd.concat([build_features(p, records, tfidf, xt).astype(np.float32) for _, p in pairs.groupby(grp)]).sort_index()
     y = pairs["label"].to_numpy()
-    print(f"features {time.time() - t0:.0f}s: {X.shape}, positive rate {y.mean():.3f}", flush=True)
     hard = {"blocker rank 1-3": (pairs["rank"] <= 3).to_numpy(),
             "lookalike name (tsort>=0.9)": (X["name_tsort"] >= 0.9).to_numpy(),
             "claimed by another S1": pairs["cand_id"].isin(claimed).to_numpy()}
+    return X, y, tfidf, hard
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cands", default=f"{OUT}/k20", help="out_dir of src.matching.sample_candidates")
+    ap.add_argument("--variants", nargs="+", default=[""], help="regexes of feature columns to drop, one per variant")
+    a = ap.parse_args()
+    t0 = time.time()
+
+    pairs, records, truth, s1, claimed, top_k = load(a.cands)
+    X, y, tfidf, hard = featurize(pairs, records, claimed)
     del claimed
+    print(f"features {time.time() - t0:.0f}s: {X.shape}, positive rate {y.mean():.3f}", flush=True)
 
     for i, v in enumerate(a.variants):
         Xv = X.drop(columns=X.filter(regex=v).columns) if v else X

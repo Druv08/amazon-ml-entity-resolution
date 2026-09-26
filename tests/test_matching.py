@@ -162,6 +162,27 @@ class OutputTests(unittest.TestCase):
         ])
 
 
+class TrainWeightTests(unittest.TestCase):
+    def test_default_weight_is_unchanged_and_weights_are_used(self):
+        from src.matching.matcher import train
+        rng = np.random.default_rng(0)
+        X = pd.DataFrame({"a": rng.random(400), "b": rng.random(400)})
+        y = (X["a"] + 0.3 * rng.random(400) > 0.6).astype(int).to_numpy()
+        base = train(X, y).predict_proba(X)[:, 1]
+        np.testing.assert_array_equal(base, train(X, y, sample_weight=None).predict_proba(X)[:, 1])
+        np.testing.assert_array_equal(base, train(X, y, sample_weight=np.ones(400)).predict_proba(X)[:, 1])
+        heavy = np.where(y == 0, 5.0, 1.0)
+        self.assertLess(train(X, y, sample_weight=heavy).predict_proba(X)[:, 1].mean(), base.mean())
+
+
+class EntityF05Tests(unittest.TestCase):
+    def test_matches_macro_f05(self):
+        from src.matching.hard_negatives import entity_f05
+        truth = {"a": {"x"}, "b": set(), "c": {"y", "z"}, "d": {"w"}, "e": set()}
+        pred = {"a": {"x"}, "b": set(), "c": {"y"}, "d": {"q"}, "e": {"v"}}
+        self.assertAlmostEqual(np.mean([entity_f05(pred[s], truth[s]) for s in truth]), macro_f05(pred, truth))
+
+
 class TopKGuardTests(unittest.TestCase):
     def test_k_mismatch_is_refused(self):
         check_top_k(20, 20)
