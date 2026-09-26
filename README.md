@@ -45,12 +45,22 @@ See [data/README.md](data/README.md) for how to set it up locally.
 
 Python 3.13 with `pip install -r requirements.txt`.
 
+## Validate a submission
+
+The official problem statement refers to `utils/validate_submission.py`; in this repo it lives under
+`resources/utils/`:
+
+```
+python resources/utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir data/raw/test
+```
+
 ## Status
 
 - Candidate generation / blocking (`src/blocking`): implemented. See
   [docs/blocking_handoff.md](docs/blocking_handoff.md) for how to generate and consume
   candidates, and [docs/blocking_data_analysis.md](docs/blocking_data_analysis.md) for the analysis
   and measured results.
-- Matching, evaluation and final pipeline: not implemented yet.
+- Matching (`src/matching`): implemented. See [docs/p3_matching.md](docs/p3_matching.md).
+- Evaluation and final pipeline: not implemented yet.
 
 Run the tests with `python -m unittest discover -s tests -t .`
