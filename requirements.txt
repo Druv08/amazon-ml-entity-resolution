@@ -1,0 +1,11 @@
+torch
+transformers
+polars
+rapidfuzz
+metaphone
+lightgbm
+catboost
+indic-transliteration
+tqdm
+joblib
+scikit-learn
