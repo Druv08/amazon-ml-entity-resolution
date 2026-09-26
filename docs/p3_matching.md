@@ -223,6 +223,34 @@ k20=output/candidates_p3/k20 k50=output/candidates_p3/k50`.
   13.7 h for K=50 (86.6M pairs), single process. This is extrapolated from the 5k-S1 smoke run at ~0.57 ms per pair
   plus ~2.5 min fixed, not measured.
 
+### Hybrid candidate set: exact K=20 plus deep K=50 candidates
+
+`src/pipeline/hybrid.py` keeps every candidate of the K=20 run, in K=20 order, and fills up to 50 with K=50-only
+candidates in K=50 rank order. P2 scales its reserved slots with K, so K=20 is not a prefix of K=50. The set is
+deterministic, has no duplicates, and can never lose a K=20 candidate.
+Reproduce: `python -m src.pipeline.hybrid --base output/candidates_p3/k20 --deep output/candidates_p3/k50`.
+
+Overlap on the 29,169 development S1:
+
+| | Candidates | Per S1 | True |
+|---|---|---|---|
+| K20 only | 277 | 0.01 | 0 |
+| both | 583,086 | 19.99 | 96,234 |
+| K50 only | 875,317 | 30.01 | 1,591 (India 952, US 639) |
+
+In practice K=50 contains the K=20 list. The deep pool adds 30 candidates per S1 at a 0.18% positive rate.
+
+Blocking on the random development S1:
+
+| Set | Pair recall | Ceiling | Per S1 | All true retained | India recall | US recall |
+|---|---|---|---|---|---|---|
+| K20 | 0.9493 | 0.9815 | 20.0 | 85.3% | 0.9223 | 0.9676 |
+| K50 | 0.9654 | 0.9874 | 50.0 | 89.8% | 0.9448 | 0.9794 |
+| HYBRID50 | 0.9654 | 0.9874 | 50.0 | 89.8% | 0.9448 | 0.9794 |
+
+The hybrid adds 1,112 true pairs beyond K=20 (random S1) and keeps all K=20 true pairs. If the hybrid is adopted,
+`candidate_pairs.tsv` must list the hybrid set.
+
 ### S1-level no-match gate (negative result, not adopted)
 
 The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
