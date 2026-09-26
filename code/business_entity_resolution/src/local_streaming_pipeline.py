@@ -213,44 +213,71 @@ def run_test_inference(target_countries=None):
         del s1_texts
         gc.collect()
 
-        # Small chunk streaming to prevent RAM overflow
-        s1_chunk_size = 500
-        ops_block_size = 300000
+        # =========================================================================
+        # INVERTED RETRIEVAL:
+        # Load S1 in large VRAM blocks (up to 150k S1 entities per GPU slice).
+        # Stream Ops in single sequential pass from disk to avoid SSD thrashing.
+        # Top-15 tracked directly on GPU via torch.topk (no Python loops / argsorts).
+        # =========================================================================
+        topk_scores_all = np.full((n_s1, 15), -1.0, dtype=np.float32)
+        topk_indices_all = np.full((n_s1, 15), -1, dtype=np.int64)
 
-        for i in tqdm(range(0, n_s1, s1_chunk_size), desc=f"Scoring {country}"):
-            s1_chunk = torch.from_numpy(s1_mmap[i:i+s1_chunk_size]).to(device)
-            c_len = s1_chunk.shape[0]
+        s1_block_size = min(n_s1, 150_000)  # ~300MB VRAM per block
+        ops_stream_batch = 32_768           # ~64MB VRAM per batch
 
-            best_scores = np.full((c_len, 15), -1.0, dtype=np.float32)
-            best_indices = np.full((c_len, 15), -1, dtype=np.int64)
+        for s1_start in range(0, n_s1, s1_block_size):
+            s1_end = min(s1_start + s1_block_size, n_s1)
+            cur_s1_len = s1_end - s1_start
+            print(f"\n[GPU] Loading S1 slice [{s1_start:,} : {s1_end:,}] to CUDA...")
 
-            for b_start in range(0, n_ops, ops_block_size):
-                b_end = min(b_start + ops_block_size, n_ops)
-                ops_block = torch.from_numpy(ops_mmap[b_start:b_end]).to(device)
-                sims = torch.matmul(s1_chunk, ops_block.T)
-                block_vals, block_inds = torch.topk(sims, k=min(15, ops_block.shape[0]), dim=1)
+            s1_tensor = torch.from_numpy(s1_mmap[s1_start:s1_end]).to(device=device, dtype=torch.float16)
 
-                b_vals_np = block_vals.cpu().numpy()
-                b_inds_np = (block_inds + b_start).cpu().numpy()
+            best_scores_gpu = torch.full((cur_s1_len, 15), -1.0, dtype=torch.float16, device=device)
+            best_indices_gpu = torch.full((cur_s1_len, 15), -1, dtype=torch.int64, device=device)
 
-                for r in range(c_len):
-                    comb_scores = np.concatenate([best_scores[r], b_vals_np[r]])
-                    comb_indices = np.concatenate([best_indices[r], b_inds_np[r]])
-                    top_idx = np.argsort(comb_scores)[::-1][:15]
-                    best_scores[r] = comb_scores[top_idx]
-                    best_indices[r] = comb_indices[top_idx]
+            pbar = tqdm(total=n_ops, desc=f"Streaming Ops ({country})", leave=False)
+            for ops_start in range(0, n_ops, ops_stream_batch):
+                ops_end = min(ops_start + ops_stream_batch, n_ops)
+                ops_chunk = torch.from_numpy(ops_mmap[ops_start:ops_end]).to(device=device, dtype=torch.float16)
 
-                del ops_block, sims, block_vals, block_inds
-                torch.cuda.empty_cache()
+                # Matrix multiplication on GPU: (cur_s1_len, 1024) @ (1024, ops_chunk_len)
+                sims = torch.matmul(s1_tensor, ops_chunk.T)
+
+                k_chunk = min(15, ops_end - ops_start)
+                chunk_scores, chunk_indices = torch.topk(sims, k=k_chunk, dim=1, largest=True, sorted=False)
+                chunk_indices = chunk_indices + ops_start
+
+                combined_scores = torch.cat([best_scores_gpu, chunk_scores], dim=1)
+                combined_indices = torch.cat([best_indices_gpu, chunk_indices], dim=1)
+
+                best_scores_gpu, top_sel = torch.topk(combined_scores, k=15, dim=1, largest=True, sorted=True)
+                best_indices_gpu = torch.gather(combined_indices, 1, top_sel)
+
+                pbar.update(ops_end - ops_start)
+
+            pbar.close()
+
+            topk_scores_all[s1_start:s1_end] = best_scores_gpu.cpu().float().numpy()
+            topk_indices_all[s1_start:s1_end] = best_indices_gpu.cpu().numpy()
+
+            del s1_tensor, best_scores_gpu, best_indices_gpu
+            torch.cuda.empty_cache()
+
+        print(f"\n[Scoring & Reranking {country} Candidates with LightGBM Ensemble...]")
+        # GBDT scoring in fast memory-friendly chunks
+        eval_chunk_size = 5_000
+        for i in tqdm(range(0, n_s1, eval_chunk_size), desc=f"GBDT Eval {country}"):
+            c_end = min(i + eval_chunk_size, n_s1)
+            c_len = c_end - i
 
             chunk_pairs = []
-            pair_meta = []  # (local_idx, op_id)
+            pair_meta = []
 
             for local_idx in range(c_len):
                 global_idx = i + local_idx
                 sid = s1_ids[global_idx]
-                row_vals = best_scores[local_idx]
-                row_inds = best_indices[local_idx]
+                row_vals = topk_scores_all[global_idx]
+                row_inds = topk_indices_all[global_idx]
 
                 top1_sc = row_vals[0]
                 top2_sc = row_vals[1] if len(row_vals) > 1 else 0.0
@@ -263,7 +290,6 @@ def run_test_inference(target_countries=None):
                         chunk_pairs.append(feats)
                         pair_meta.append((local_idx, ops_ids[c_idx_int]))
 
-            # Immediate batch prediction and output flush
             chunk_matches = {local_idx: [] for local_idx in range(c_len)}
             if chunk_pairs:
                 X_chunk = np.array(chunk_pairs)
@@ -272,7 +298,6 @@ def run_test_inference(target_countries=None):
                     p_sum += m.predict_proba(X_chunk)[:, 1]
                 probs = p_sum / len(models)
 
-                # Local cluster assignment
                 has_anchor_local = set()
                 for (local_idx, op_id), prob in zip(pair_meta, probs):
                     if prob >= ANCHOR_THRESH:
@@ -281,13 +306,12 @@ def run_test_inference(target_countries=None):
                     elif local_idx in has_anchor_local and prob >= SISTER_THRESH:
                         chunk_matches[local_idx].append((op_id, prob))
 
-            # Stream straight to file
             for local_idx in range(c_len):
                 global_idx = i + local_idx
                 sid = s1_ids[global_idx]
-                row_inds = best_indices[local_idx]
-                row_vals = best_scores[local_idx]
-                
+                row_inds = topk_indices_all[global_idx]
+                row_vals = topk_scores_all[global_idx]
+
                 cands = [ops_ids[int(c)] for score, c in zip(row_vals, row_inds) if c != -1 and score >= 0.55]
                 matches = [m[0] for m in chunk_matches[local_idx] if m[0] in cands]
 
@@ -297,11 +321,7 @@ def run_test_inference(target_countries=None):
             f_cand.flush()
             f_match.flush()
 
-            del s1_chunk, chunk_pairs, pair_meta, chunk_matches
-            torch.cuda.empty_cache()
-            gc.collect()
-
-        del ops_mmap, s1_mmap, ops_ids, s1_ids
+        del ops_mmap, s1_mmap, ops_ids, s1_ids, topk_scores_all, topk_indices_all
         gc.collect()
 
     f_cand.close()
