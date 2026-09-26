@@ -29,28 +29,11 @@ from collections import Counter
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.csv as pacsv
 
-RAW_COLUMNS = ["entity_id", "business_name", "business_address", "country"]
-CLEAN_COLUMNS = ["entity_id", "business_name", "business_name_normalized", "name_tokens", "business_address",
-                 "address_normalized", "country", "country_normalized", "state_normalized",
-                 "postal_code_normalized", "name_script"]
+from .clean_data import CLEAN_COLUMNS, RAW_COLUMNS, read_table
+
 INDIC = r"[\x{0900}-\x{0DFF}]"
 DIRECTIONS = r"\b(north|south|east|west)\b"
-
-
-def read_table(path, delimiter, columns):
-    quote = False if delimiter == "\t" else '"'
-    table = pacsv.read_csv(
-        path,
-        read_options=pacsv.ReadOptions(block_size=1 << 26),
-        parse_options=pacsv.ParseOptions(delimiter=delimiter, quote_char=quote),
-        convert_options=pacsv.ConvertOptions(column_types={c: pa.string() for c in columns},
-                                             strings_can_be_null=False),
-    )
-    if table.column_names != columns:
-        raise ValueError(f"{path}: columns {table.column_names}, expected {columns}")
-    return table
 
 
 def count(mask):

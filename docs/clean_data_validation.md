@@ -124,3 +124,23 @@ is consistent in every sampled row.
   cleaning code, and fix problems 2–4.
 - **P2 blocking already handles these cases on raw text:** its own normaliser keeps Indic vowel signs,
   transliterates, and folds accents.
+
+## 7. Loading raw, clean or both
+
+`src/preprocessing/clean_data.py` gives experiments one switch. No P2/P3 algorithm uses it yet.
+
+```python
+from src.preprocessing.clean_data import load_source, clean_available
+
+df = load_source("train", 2, mode="raw")        # name/address = raw text
+df = load_source("train", 2, mode="clean")      # name/address = P1 normalised text
+df = load_source("train", 2, mode="raw+clean")  # name/address = raw text, plus clean_* columns
+```
+
+- **Raw text in every mode:** `raw_name` and `raw_address` are always present.
+- **Clean columns:** `clean_name`, `clean_address`, `clean_name_tokens`, `clean_country`, `clean_state`,
+  `clean_postal_code` and `clean_name_script` are added whenever clean data is requested.
+- **Alignment check:** every load verifies that clean rows align 1:1 with the raw rows.
+- **Missing splits:** requesting clean data for a split without P1 files (currently `test`) raises
+  `CleanDataUnavailable`, never a silent fallback.
+- **Speed:** loading takes about 0.5 s (S1) to 1.5 s (S3) for the train split.

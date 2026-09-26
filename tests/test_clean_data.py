@@ -70,7 +70,8 @@ class ValidateCleanTests(unittest.TestCase):
         self.assertEqual(r["sample_file"]["rows_identical_to_full_file"], 1)
 
     def test_sample_with_cp1252_line(self):
-        from src.preprocessing.validate_clean import check_sample, read_table, CLEAN_COLUMNS
+        from src.preprocessing.clean_data import CLEAN_COLUMNS, read_table
+        from src.preprocessing.validate_clean import check_sample
         full = read_table(os.path.join(self.clean, "source2_clean.csv"), ",", CLEAN_COLUMNS)
         path = os.path.join(self.tmp, "bad_sample.csv")
         with open(path, "wb") as f:
@@ -81,6 +82,64 @@ class ValidateCleanTests(unittest.TestCase):
         self.assertEqual(r["non_utf8_lines"], 1)
         self.assertEqual(r["ids_in_full_file"], 1)
         self.assertEqual(r["rows_identical_to_full_file"], 1)
+
+
+class LoaderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.raw, cls.clean = make_dirs(cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def load(self, split, source, mode):
+        from src.preprocessing.clean_data import load_source
+        return load_source(split, source, mode, raw_dir=self.raw, clean_dir=self.clean)
+
+    def test_raw_mode(self):
+        df = self.load("train", 1, "raw")
+        self.assertEqual(list(df.columns), ["entity_id", "country", "raw_name", "raw_address", "name", "address"])
+        self.assertEqual(df["name"].tolist(), ["Acme Tools Inc", "NA", "Nétwork Labs"])
+        self.assertEqual(df["name"].tolist(), df["raw_name"].tolist())
+
+    def test_clean_mode_uses_normalised_text_and_keeps_raw(self):
+        df = self.load("train", 2, "clean")
+        self.assertEqual(df["name"].tolist(), ["acme tools incorporated", "", "nétwork laboratories"])
+        self.assertEqual(df["address"].tolist()[0], "12 oak street dayton oh")
+        self.assertEqual(df["raw_name"].tolist()[1], "NA")  # raw text survives P1's emptied value
+        for col in ("clean_name", "clean_address", "clean_name_tokens", "clean_country", "clean_state",
+                    "clean_postal_code", "clean_name_script"):
+            self.assertIn(col, df.columns)
+
+    def test_raw_plus_clean_mode(self):
+        df = self.load("train", 3, "raw+clean")
+        self.assertEqual(df["name"].tolist(), df["raw_name"].tolist())
+        self.assertEqual(df["clean_name"].tolist()[0], "acme tools incorporated")
+        self.assertEqual(df["clean_country"].tolist(), ["US", "IN", "IN"])
+
+    def test_test_split_has_no_clean_data(self):
+        from src.preprocessing.clean_data import CleanDataUnavailable, clean_available
+        self.assertFalse(clean_available("test", 1, self.clean))
+        self.assertTrue(clean_available("train", 1, self.clean))
+        with self.assertRaises(CleanDataUnavailable):
+            self.load("test", 1, "clean")
+        self.assertEqual(self.load("test", 1, "raw")["name"].tolist(), ["Other Co"])
+
+    def test_misaligned_clean_file_is_rejected(self):
+        from src.preprocessing.clean_data import load_source
+        bad = os.path.join(self.tmp, "bad_clean")
+        os.makedirs(bad, exist_ok=True)
+        with open(os.path.join(self.clean, "source1_clean.csv"), encoding="utf-8") as f:
+            lines = f.readlines()
+        write(os.path.join(bad, "source1_clean.csv"), lines[0] + lines[2] + lines[1] + lines[3])  # swapped rows
+        with self.assertRaises(ValueError):
+            load_source("train", 1, "clean", raw_dir=self.raw, clean_dir=bad)
+
+    def test_unknown_mode(self):
+        with self.assertRaises(ValueError):
+            self.load("train", 1, "cleaned")
 
 
 if __name__ == "__main__":

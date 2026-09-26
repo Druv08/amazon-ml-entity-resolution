@@ -33,7 +33,8 @@ data/clean/source3_clean.csv   data/clean/source3_clean_SAMPLE.csv
 
 These are comma-separated CSVs. The raw `business_name` / `business_address` columns are kept
 next to the normalised ones. `data/raw/` stays the untouched source of truth. See
-`docs/clean_data_validation.md` for how the clean files relate to the raw train/test files.
+`docs/clean_data_validation.md` for how the clean files relate to the raw train/test files, and
+`src/preprocessing/clean_data.py` (`load_source(split, source, mode)`) to load raw, clean or both.
 
 ## Rules
 
