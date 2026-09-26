@@ -196,9 +196,24 @@ def macro_f05(pred, truth):
 
 def exclusive(pairs, prob):
     """Each S2/S3 record belongs to at most one S1 (true in train GT): only its best-scoring S1 may keep it.
-    Only bites when competing S1s are scored together, i.e. full test inference, not a random train sample."""
-    best = pd.Series(prob).groupby(pairs["cand_id"].to_numpy()).transform("max").to_numpy()
-    return np.where(prob >= best, prob, 0.0)
+    Only bites when competing S1s are scored together, i.e. full test inference, not a random train sample.
+    Ties on the best prob (common with float32 probs) go to the smallest s1_id, then the earliest row, so exactly
+    one S1 keeps each candidate whatever the row order."""
+    prob = np.asarray(prob)
+    cand = pairs["cand_id"].to_numpy()
+    best = pd.Series(prob).groupby(cand).transform("max").to_numpy()
+    top = np.flatnonzero(prob >= best)  # the best row(s) of every candidate
+    tied = pd.DataFrame({"c": cand[top], "s": pairs["s1_id"].to_numpy()[top], "i": top})
+    winners = tied.sort_values(["c", "s", "i"], kind="mergesort").drop_duplicates("c")["i"].to_numpy()
+    keep = np.zeros(len(prob), dtype=bool)
+    keep[winners] = True
+    return np.where(keep, prob, 0.0)
+
+
+def check_top_k(model_k, cand_k, split="test"):
+    """Rank/gap/cross-entity features depend on the candidate list length: refuse a K the model was not trained on."""
+    if cand_k != model_k:
+        raise SystemExit(f"model trained on K={model_k} candidates, {split} candidates have K={cand_k}")
 
 
 def to_matches(pairs, prob, threshold, s1_ids):
@@ -247,6 +262,7 @@ if __name__ == "__main__":
     assert macro_f05({"a": {"x"}}, {"a": set()}) == 0.0
     pp = pd.DataFrame({"s1_id": ["a", "b", "b"], "cand_id": ["x", "x", "y"]})
     assert list(exclusive(pp, np.array([0.9, 0.7, 0.8]))) == [0.9, 0.0, 0.8]
+    assert list(exclusive(pp, np.array([0.7, 0.7, 0.8]))) == [0.7, 0.0, 0.8]  # tie -> smallest s1_id only
     fr = pd.DataFrame({"s1_entity_id": ["S1-a", "S1-a"], "candidate_entity_id": ["S2-x", "S3-y"], "score": [2.0, 1.0],
                        "rank": [1, 2], "name_score": [1.0, 0.0], "s1_name": ["A"] * 2, "s1_address": ["NULL"] * 2,
                        "s1_country": ["US"] * 2, "candidate_name": ["A", "nan"], "candidate_address": ["1 st", ""],

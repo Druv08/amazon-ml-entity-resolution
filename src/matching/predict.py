@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 
 from src.blocking.handoff import CandidateStore
-from src.matching.matcher import build_features, exclusive, from_store, to_matches, top2, write_matching_results, xtop
+from src.matching.matcher import (build_features, check_top_k, exclusive, from_store, to_matches, top2,
+                                  write_matching_results, xtop)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="output/candidates_p3/k20/matcher.pkl")
@@ -29,9 +30,7 @@ t0 = time.time()
 with open(a.model, "rb") as fh:
     m = pickle.load(fh)
 store = CandidateStore(a.split, out_dir=a.cands)
-k = store.meta["config"]["top_k"]
-if k != m["top_k"]:  # rank/gap/cross-entity features depend on the candidate list length
-    raise SystemExit(f"model trained on K={m['top_k']} candidates, {a.split} candidates have K={k}")
+check_top_k(m["top_k"], store.meta["config"]["top_k"], a.split)
 tf = m["tfidf"]
 
 tops = []
