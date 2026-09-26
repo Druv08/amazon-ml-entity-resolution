@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import polars as pl
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 from rapidfuzz import fuzz, distance
 from metaphone import doublemetaphone
 from transformers import AutoTokenizer, AutoModel
@@ -72,7 +73,7 @@ def extract_meta(name: str, addr: str):
 
     return (core_name, raw_name, meta_keys), (core_addr, nums, states)
 
-def compute_features_fast(s1_meta, op_meta, dense_sc, rank_pos, margin_delta):
+def fill_feature_row(out_arr, row_idx, s1_meta, op_meta, dense_sc, rank_pos, margin_delta):
     (s1_cn, s1_rn, s1_meta_keys), (s1_ca, s1_nums, s1_st) = s1_meta
     (op_cn, op_rn, op_meta_keys), (op_ca, op_nums, op_st) = op_meta
 
@@ -106,16 +107,28 @@ def compute_features_fast(s1_meta, op_meta, dense_sc, rank_pos, margin_delta):
     f_composite_lex_dense = f_dense * f_name_sort
     f_composite_addr_dense = f_dense * f_addr_sort
 
-    return [
-        f_dense, f_rank, f_margin,
-        f_name_sort, f_name_set, f_name_ratio, f_name_partial, f_name_jw,
-        f_exact_sub, f_phonetic,
-        f_addr_sort, f_addr_set, f_addr_jw,
-        f_num_match, f_num_diff, num_jaccard,
-        f_state_conflict, f_state_match,
-        len_diff, tok_diff,
-        f_composite_lex_dense, f_composite_addr_dense
-    ]
+    out_arr[row_idx, 0] = f_dense
+    out_arr[row_idx, 1] = f_rank
+    out_arr[row_idx, 2] = f_margin
+    out_arr[row_idx, 3] = f_name_sort
+    out_arr[row_idx, 4] = f_name_set
+    out_arr[row_idx, 5] = f_name_ratio
+    out_arr[row_idx, 6] = f_name_partial
+    out_arr[row_idx, 7] = f_name_jw
+    out_arr[row_idx, 8] = f_exact_sub
+    out_arr[row_idx, 9] = f_phonetic
+    out_arr[row_idx, 10] = f_addr_sort
+    out_arr[row_idx, 11] = f_addr_set
+    out_arr[row_idx, 12] = f_addr_jw
+    out_arr[row_idx, 13] = f_num_match
+    out_arr[row_idx, 14] = f_num_diff
+    out_arr[row_idx, 15] = num_jaccard
+    out_arr[row_idx, 16] = f_state_conflict
+    out_arr[row_idx, 17] = f_state_match
+    out_arr[row_idx, 18] = len_diff
+    out_arr[row_idx, 19] = float(tok_diff)
+    out_arr[row_idx, 20] = f_composite_lex_dense
+    out_arr[row_idx, 21] = f_composite_addr_dense
 
 @torch.no_grad()
 def encode_to_disk(texts, model, tokenizer, device, file_path, batch_size=512):
@@ -213,34 +226,28 @@ def run_test_inference(target_countries=None):
         del s1_texts
         gc.collect()
 
-        # =========================================================================
-        # INVERTED RETRIEVAL:
-        # Load S1 in large VRAM blocks (up to 150k S1 entities per GPU slice).
-        # Stream Ops in single sequential pass from disk to avoid SSD thrashing.
-        # Top-15 tracked directly on GPU via torch.topk (no Python loops / argsorts).
-        # =========================================================================
+        # Inverted GPU Top-K Retrieval
         topk_scores_all = np.full((n_s1, 15), -1.0, dtype=np.float32)
         topk_indices_all = np.full((n_s1, 15), -1, dtype=np.int64)
 
-        s1_block_size = min(n_s1, 150_000)  # ~300MB VRAM per block
-        ops_stream_batch = 32_768           # ~64MB VRAM per batch
+        s1_block_size = min(n_s1, 450_000)
+        ops_stream_batch = 32_768
 
         for s1_start in range(0, n_s1, s1_block_size):
             s1_end = min(s1_start + s1_block_size, n_s1)
             cur_s1_len = s1_end - s1_start
-            print(f"\n[GPU] Loading S1 slice [{s1_start:,} : {s1_end:,}] to CUDA...")
+            print(f"\n[GPU Retrieval] Processing S1 slice [{s1_start:,} : {s1_end:,}] ({cur_s1_len:,} entities)...")
 
-            s1_tensor = torch.from_numpy(s1_mmap[s1_start:s1_end]).to(device=device, dtype=torch.float16)
+            s1_tensor = torch.from_numpy(np.array(s1_mmap[s1_start:s1_end])).to(device=device, dtype=torch.float16)
 
             best_scores_gpu = torch.full((cur_s1_len, 15), -1.0, dtype=torch.float16, device=device)
             best_indices_gpu = torch.full((cur_s1_len, 15), -1, dtype=torch.int64, device=device)
 
-            pbar = tqdm(total=n_ops, desc=f"Streaming Ops ({country})", leave=False)
+            pbar = tqdm(total=n_ops, desc=f"Ops Pass ({country})", leave=False)
             for ops_start in range(0, n_ops, ops_stream_batch):
                 ops_end = min(ops_start + ops_stream_batch, n_ops)
-                ops_chunk = torch.from_numpy(ops_mmap[ops_start:ops_end]).to(device=device, dtype=torch.float16)
+                ops_chunk = torch.from_numpy(np.array(ops_mmap[ops_start:ops_end])).to(device=device, dtype=torch.float16)
 
-                # Matrix multiplication on GPU: (cur_s1_len, 1024) @ (1024, ops_chunk_len)
                 sims = torch.matmul(s1_tensor, ops_chunk.T)
 
                 k_chunk = min(15, ops_end - ops_start)
@@ -263,19 +270,20 @@ def run_test_inference(target_countries=None):
             del s1_tensor, best_scores_gpu, best_indices_gpu
             torch.cuda.empty_cache()
 
-        print(f"\n[Scoring & Reranking {country} Candidates with LightGBM Ensemble...]")
-        # GBDT scoring in fast memory-friendly chunks
-        eval_chunk_size = 5_000
-        for i in tqdm(range(0, n_s1, eval_chunk_size), desc=f"GBDT Eval {country}"):
-            c_end = min(i + eval_chunk_size, n_s1)
+        print(f"\n[GBDT Reranking] Multi-threaded vectorized evaluation for {country}...")
+
+        eval_batch_s1 = 25_000
+        n_workers = min(os.cpu_count() or 4, 8)
+
+        for i in tqdm(range(0, n_s1, eval_batch_s1), desc=f"GBDT Eval {country}"):
+            c_end = min(i + eval_batch_s1, n_s1)
             c_len = c_end - i
 
-            chunk_pairs = []
-            pair_meta = []
+            candidate_items = []
+            s1_cand_counts = [0] * c_len
 
             for local_idx in range(c_len):
                 global_idx = i + local_idx
-                sid = s1_ids[global_idx]
                 row_vals = topk_scores_all[global_idx]
                 row_inds = topk_indices_all[global_idx]
 
@@ -285,38 +293,58 @@ def run_test_inference(target_countries=None):
 
                 for rank_pos, (score, c_idx) in enumerate(zip(row_vals, row_inds)):
                     if c_idx != -1 and score >= 0.62:
-                        c_idx_int = int(c_idx)
-                        feats = compute_features_fast(s1_meta[global_idx], ops_meta[c_idx_int], score, rank_pos, margin_delta)
-                        chunk_pairs.append(feats)
-                        pair_meta.append((local_idx, ops_ids[c_idx_int]))
+                        candidate_items.append((local_idx, rank_pos, int(c_idx), score, margin_delta))
+                        s1_cand_counts[local_idx] += 1
 
-            chunk_matches = {local_idx: [] for local_idx in range(c_len)}
-            if chunk_pairs:
-                X_chunk = np.array(chunk_pairs)
-                p_sum = np.zeros(len(X_chunk), dtype=np.float32)
+            n_candidates = len(candidate_items)
+            X_chunk = np.zeros((n_candidates, 22), dtype=np.float32)
+
+            if n_candidates > 0:
+                def worker_fill(range_tuple):
+                    start_idx, end_idx = range_tuple
+                    for c_i in range(start_idx, end_idx):
+                        loc_i, r_pos, op_i, sc, m_delta = candidate_items[c_i]
+                        g_idx = i + loc_i
+                        fill_feature_row(X_chunk, c_i, s1_meta[g_idx], ops_meta[op_i], sc, r_pos, m_delta)
+
+                chunk_step = (n_candidates + n_workers - 1) // n_workers
+                ranges = [(k, min(k + chunk_step, n_candidates)) for k in range(0, n_candidates, chunk_step)]
+
+                with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                    list(executor.map(worker_fill, ranges))
+
+                p_sum = np.zeros(n_candidates, dtype=np.float32)
                 for m in models:
                     p_sum += m.predict_proba(X_chunk)[:, 1]
                 probs = p_sum / len(models)
+            else:
+                probs = np.array([], dtype=np.float32)
 
-                has_anchor_local = set()
-                for (local_idx, op_id), prob in zip(pair_meta, probs):
-                    if prob >= ANCHOR_THRESH:
-                        has_anchor_local.add(local_idx)
-                        chunk_matches[local_idx].append((op_id, prob))
-                    elif local_idx in has_anchor_local and prob >= SISTER_THRESH:
-                        chunk_matches[local_idx].append((op_id, prob))
-
+            cand_ptr = 0
             for local_idx in range(c_len):
                 global_idx = i + local_idx
                 sid = s1_ids[global_idx]
                 row_inds = topk_indices_all[global_idx]
                 row_vals = topk_scores_all[global_idx]
 
-                cands = [ops_ids[int(c)] for score, c in zip(row_vals, row_inds) if c != -1 and score >= 0.55]
-                matches = [m[0] for m in chunk_matches[local_idx] if m[0] in cands]
+                k_count = s1_cand_counts[local_idx]
+                matched_ops = []
 
-                f_cand.write(f"{sid}\t{','.join(cands)}\n")
-                f_match.write(f"{sid}\t{','.join(matches)}\n")
+                if k_count > 0:
+                    ent_probs = probs[cand_ptr : cand_ptr + k_count]
+                    ent_items = candidate_items[cand_ptr : cand_ptr + k_count]
+                    cand_ptr += k_count
+
+                    max_prob = np.max(ent_probs)
+                    if max_prob >= ANCHOR_THRESH:
+                        for (_, _, op_i, _, _), p in zip(ent_items, ent_probs):
+                            if p >= SISTER_THRESH:
+                                matched_ops.append(ops_ids[op_i])
+
+                cands_55 = [ops_ids[int(c)] for score, c in zip(row_vals, row_inds) if c != -1 and score >= 0.55]
+                
+                f_cand.write(f"{sid}\t{','.join(cands_55)}\n")
+                f_match.write(f"{sid}\t{','.join(matched_ops)}\n")
 
             f_cand.flush()
             f_match.flush()
@@ -326,7 +354,7 @@ def run_test_inference(target_countries=None):
 
     f_cand.close()
     f_match.close()
-    print(f"\nDone! Output written to {match_path} and {cand_path}")
+    print(f"\n[DONE] Pipeline complete! Output written to {match_path} and {cand_path}")
 
 if __name__ == "__main__":
     import argparse
