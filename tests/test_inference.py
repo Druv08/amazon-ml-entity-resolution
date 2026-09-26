@@ -14,11 +14,14 @@ import pandas as pd
 
 from src.matching.matcher import (build_features, exclusive, fit_tfidf, from_store, to_matches, top2,
                                   write_matching_results, xtop)
+from src.matching.extra_features import NameStats
 from src.matching.stream import CandidateIndex, TopTwo, Winners, s1_ranks, stream_predict, write_matches
 
 
 def reference_predict(store, m, out_path, s1_limit=None):
     """The previous predict.py: every scored pair in memory, then exclusive() + to_matches()."""
+    groups = tuple(m.get("feature_groups", ()))
+    ns = NameStats.from_tables(store.source_tables()) if "E" in groups else None
     tops = [xtop(*from_store(df), m["tfidf"]) for df in store.iter_frames(with_records=True)]
     xt = {}
     for c in tops[0]:
@@ -27,7 +30,7 @@ def reference_predict(store, m, out_path, s1_limit=None):
     parts = []
     for df in store.iter_frames(with_records=True):
         pairs, records = from_store(df)
-        X = build_features(pairs, records, m["tfidf"], xt)[m["features"]]
+        X = build_features(pairs, records, m["tfidf"], xt, groups, ns)[m["features"]]
         parts.append(pairs[["s1_id", "cand_id"]].assign(prob=m["model"].predict_proba(X)[:, 1].astype(np.float32)))
     scored = pd.concat(parts, ignore_index=True)
     s1_ids = store.source_tables()[1]["entity_id"]
@@ -223,6 +226,20 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(read(got), read(ref))
         self.assertEqual(r["pairs"], len(scored))
         self.assertEqual(r["s1"], 30)
+
+    def test_streaming_equals_reference_with_feature_groups(self):
+        ns = NameStats.from_tables(self.store.source_tables())
+        frame = pd.concat(self.store.iter_frames(with_records=True), ignore_index=True)
+        pairs, records = from_store(frame)
+        feats = list(build_features(pairs, records, self.model["tfidf"], None, ("A", "C", "E"), ns).columns)
+        self.assertIn("num_best_ratio", feats)
+        self.assertIn("ph_jacc", feats)
+        self.assertIn("core_idf_jacc", feats)
+        m = dict(self.model, features=feats, feature_groups=("A", "C", "E"))
+        ref, got = os.path.join(self.tmp, "ref_g.tsv"), os.path.join(self.tmp, "got_g.tsv")
+        reference_predict(self.store, m, ref)
+        stream_predict(self.store, m, got, log=lambda *a: None)
+        self.assertEqual(read(got), read(ref))
 
     def test_output_is_exclusive_subset_in_file_order(self):
         got = os.path.join(self.tmp, "got2.tsv")

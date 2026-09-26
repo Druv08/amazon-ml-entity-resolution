@@ -20,6 +20,7 @@ from sklearn.model_selection import GroupKFold
 from src.blocking.handoff import CandidateStore
 from src.matching.matcher import (best_threshold, build_features, exclusive, fit_tfidf, from_store, macro_f05,
                                   to_matches, train, xtop)
+from src.matching.extra_features import PRODUCTION_GROUPS, load_name_stats
 from src.matching.sample_candidates import OUT
 
 
@@ -73,12 +74,15 @@ def load(cands):
     return pairs, records, truth, s1, claimed, top_k
 
 
-def featurize(pairs, records, claimed):
-    """-> X, y, fitted tfidf and the hard-negative masks used in report()."""
+def featurize(pairs, records, claimed, groups=()):
+    """-> X, y, fitted tfidf and the hard-negative masks used in report(). groups: extra feature groups
+    (extra_features.py); group E uses the name statistics of the whole training split."""
     tfidf = fit_tfidf(records)
     xt = xtop(pairs, records, tfidf)  # cross-entity top-2 over the whole sample, features built per 3k-S1 chunk
+    ns = load_name_stats("train") if "E" in groups else None
     grp = pairs["s1_id"].factorize()[0] // 3000
-    X = pd.concat([build_features(p, records, tfidf, xt).astype(np.float32) for _, p in pairs.groupby(grp)]).sort_index()
+    X = pd.concat([build_features(p, records, tfidf, xt, groups, ns).astype(np.float32)
+                   for _, p in pairs.groupby(grp)]).sort_index()
     y = pairs["label"].to_numpy()
     hard = {"blocker rank 1-3": (pairs["rank"] <= 3).to_numpy(),
             "lookalike name (tsort>=0.9)": (X["name_tsort"] >= 0.9).to_numpy(),
@@ -90,11 +94,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--cands", default=f"{OUT}/k20", help="out_dir of src.matching.sample_candidates")
     ap.add_argument("--variants", nargs="+", default=[""], help="regexes of feature columns to drop, one per variant")
+    ap.add_argument("--groups", default="".join(PRODUCTION_GROUPS), help="extra feature groups, e.g. ACE ('' = none)")
     a = ap.parse_args()
     t0 = time.time()
 
     pairs, records, truth, s1, claimed, top_k = load(a.cands)
-    X, y, tfidf, hard = featurize(pairs, records, claimed)
+    groups = tuple(a.groups)
+    X, y, tfidf, hard = featurize(pairs, records, claimed, groups)
     del claimed
     print(f"features {time.time() - t0:.0f}s: {X.shape}, positive rate {y.mean():.3f}", flush=True)
 
@@ -109,5 +115,5 @@ if __name__ == "__main__":
             pairs[["s1_id", "cand_id", "rank", "label"]].assign(prob=oof).to_parquet(f"{a.cands}/oof.parquet")  # P4
             with open(f"{a.cands}/matcher.pkl", "wb") as fh:  # predict.py always applies exclusive()
                 pickle.dump({"model": train(Xv, y), "threshold": r["threshold"], "features": list(Xv.columns),
-                             "tfidf": tfidf, "top_k": top_k}, fh)
+                             "tfidf": tfidf, "top_k": top_k, "feature_groups": groups}, fh)
             print(f"  saved {a.cands}/matcher.pkl + oof.parquet, {time.time() - t0:.0f}s", flush=True)

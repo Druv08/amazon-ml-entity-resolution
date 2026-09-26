@@ -152,6 +152,54 @@ Over 583,363 pairs and 29,169 S1:
 | Claimed by another S1 | 33% of FPs, but the owner S1 is in the development sample for only 2.1% of them. Development data cannot teach cross-S1 ownership features; exclusivity handles it once every S1 is scored. |
 | Blocking loss | 5,200 true pairs (5.1%) are not among the K=20 candidates; 63% of them are India. |
 
+### Targeted features (adopted: groups A + C + E)
+
+Each feature group targets one error class above (`src/matching/extra_features.py`). All of them are computed
+identically for train and test from raw data only, with no external data.
+
+| Group | Features | Motivation |
+|---|---|---|
+| A: address numbers | `num_shared_n`, `num_only_s1_n`, `num_only_cand_n`, `num_best_ratio` (typo-tolerant best number match), `num_prefix`, `addr_word_jacc` | missed true pairs with conflicting / typo'd house numbers |
+| C: transliteration | `ph_jacc` and `ph_bigram_hit` (P2's offline phonetic keys), `latin_tsort` (after P2 transliteration), `script_mismatch` | Indian-script candidates |
+| D: blocker evidence | `block_addr_score` = block_score − name_score | tested, **not adopted** |
+| E: name rarity | `s1_core_freq`, `cand_core_freq` (core-name frequency in the split), `core_idf_jacc`, `core_rarest_shared_idf` | chains / branches, and same-address neighbours that share only generic words |
+
+About group E:
+- Its statistics come from the scored split's own three source files (`NameStats`), so training uses the train
+  files and inference uses the test files.
+- The IDFs do not depend on split size. The core-name counts are raw counts; the test split is about 22% smaller.
+
+Setup: K=20 development sample, same 5 GroupKFold folds, unweighted model, threshold retuned per variant, deltas
+paired against base with the same seed.
+Reproduce: `python -m src.matching.feature_experiments --variants base A C D E` and
+`--variants base A+C+E C+E A+E A+C --seeds 0 1`.
+
+| Variant | Features | macro-F0.5 | Δ vs base | India | US | Singletons empty | AUC | FPs | Rank 1–3 FPs | Lookalike FPs | Claimed FPs | Threshold |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 47 | 0.9407 | – | 0.9224 | 0.9529 | 0.895 | 0.9986 | 1,895 | 885 | 611 | 629 | 0.65 |
+| +A | 53 | 0.9428 | +0.0021 ± 0.0006 | 0.9250 | 0.9547 | 0.905 | 0.9987 | 1,598 | 772 | 514 | 495 | 0.70 |
+| +C | 51 | 0.9443 | +0.0036 ± 0.0005 | 0.9282 | 0.9550 | 0.915 | 0.9988 | 1,689 | 727 | 601 | 569 | 0.65 |
+| +D | 48 | 0.9400 | −0.0007 ± 0.0004 | 0.9219 | 0.9521 | 0.892 | 0.9986 | 1,893 | 884 | 622 | 606 | 0.65 |
+| +E | 51 | 0.9447 | +0.0041 ± 0.0006 | 0.9277 | 0.9562 | 0.912 | 0.9989 | 1,424 | 728 | 388 | 328 | 0.68 |
+| +A+C | 57 | 0.9469 | +0.0062 ± 0.0006 | 0.9317 | 0.9571 | 0.928 | 0.9990 | 1,332 | 611 | 493 | 434 | 0.71 |
+| +A+E | 57 | 0.9472 | +0.0065 ± 0.0007 | 0.9295 | 0.9591 | 0.933 | 0.9990 | 1,040 | 559 | 295 | 219 | 0.76 |
+| +C+E | 55 | 0.9480 | +0.0073 ± 0.0007 | 0.9328 | 0.9581 | 0.923 | 0.9990 | 1,336 | 637 | 414 | 350 | 0.67 |
+| **+A+C+E** | **61** | **0.9494** | **+0.0087 ± 0.0007** | **0.9335** | **0.9601** | **0.929** | **0.9991** | **1,216** | **612** | **353** | **289** | 0.70 |
+| base, seed 1 | 47 | 0.9393 | – | 0.9211 | 0.9515 | 0.883 | 0.9986 | 1,907 | 904 | 607 | 593 | 0.65 |
+| +A+C+E, seed 1 | 61 | 0.9501 | +0.0108 ± 0.0007 | 0.9346 | 0.9605 | 0.932 | 0.9991 | 1,227 | 610 | 366 | 289 | 0.69 |
+
+The gain is about 9–15 paired standard errors and holds under a second seed, far above the ~0.001 noise floor.
+India, US and singletons all improve, and FPs fall by 36%.
+
+Production: `src.matching.train` defaults to `--groups ACE` and stores `feature_groups` in `matcher.pkl`.
+The retrained model reproduces the table exactly: macro-F0.5 0.9494, India 0.9335, US 0.9601, singletons 0.929,
+AUC 0.9991, threshold 0.70.
+
+Inference (`predict.py`) computes group E's statistics from the test split's own source files, adding about 2 min
+and about 0.9 GB once, independent of K. The real 5k-S1 smoke run peaks at 4.6 GB and is byte-identical to the
+in-memory reference. Group D is not used. Ownership features (family B) were
+not built, because the error analysis showed the development sample cannot train them.
+
 ### Hard-negative weighting (negative result, not adopted)
 
 The experiment up-weights the training negatives the blocker ranks 1–3 (21,631 pairs, about 47% of FPs). Everything else is held fixed: the same 47 features, the same 5 GroupKFold folds, and a threshold retuned per configuration on its own OOF predictions. Scores are on the 19,819 random development S1; the final holdout was not used.

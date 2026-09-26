@@ -15,6 +15,7 @@ earliest row (shard order, then row order within the shard).
 import numpy as np
 import pandas as pd
 
+from .extra_features import NameStats
 from .matcher import build_features, from_store, xscores
 
 _BIG = np.iinfo(np.int64).max
@@ -132,6 +133,8 @@ def stream_predict(store, model, out_path, s1_limit=None, log=print):
     s1_all = tables[1]["entity_id"].to_numpy(dtype=object)
     rank = s1_ranks(s1_all)
     n_shards = len(store.shard_paths)
+    groups = tuple(model.get("feature_groups", ()))
+    name_stats = NameStats.from_tables(tables) if "E" in groups else None  # this split's own statistics
 
     tops = {}
     for i, df in enumerate(store.iter_frames(with_records=True)):
@@ -149,7 +152,7 @@ def stream_predict(store, model, out_path, s1_limit=None, log=print):
         keys = index.keys(df["candidate_source"], df["candidate_row"])
         pairs, records = from_store(df)
         xt = {c: t.frame(keys, pairs["cand_id"]) for c, t in tops.items()}
-        X = build_features(pairs, records, model["tfidf"], xt)[model["features"]]
+        X = build_features(pairs, records, model["tfidf"], xt, groups, name_stats)[model["features"]]
         prob = model["model"].predict_proba(X)[:, 1].astype(np.float32)
         winners.update(keys, prob, rank[df["s1_row"].to_numpy()], row0 + np.arange(len(df)))
         row0 += len(df)

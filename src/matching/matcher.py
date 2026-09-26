@@ -119,9 +119,11 @@ def from_store(df):
     return df[keep].reset_index(drop=True), records
 
 
-def build_features(pairs, records, tfidf=None, xtop=None):
+def build_features(pairs, records, tfidf=None, xtop=None, groups=(), name_stats=None):
     """tfidf: output of fit_tfidf(); None falls back to fitting on this batch (inconsistent across batches).
-    xtop: {score: top2()} over ALL pairs (predict.py); None = this batch only, fine when it holds every pair."""
+    xtop: {score: top2()} over ALL pairs (predict.py); None = this batch only, fine when it holds every pair.
+    groups: extra feature groups from extra_features.py (the model's "feature_groups"); name_stats: the split's
+    extra_features.NameStats, needed by group E."""
     rec = records.set_index("entity_id")
     a, b = rec.loc[pairs["s1_id"]], rec.loc[pairs["cand_id"]]
     f = pd.DataFrame(index=pairs.index)
@@ -175,6 +177,9 @@ def build_features(pairs, records, tfidf=None, xtop=None):
     cand = pairs["cand_id"].to_numpy()
     for c in ("name_tfidf",) + (("block_score",) if "block_score" in f else ()):
         f[f"{c}_xgap"] = _other_gap(f[c], cand, xtop[c] if xtop else top2(f[c], cand))
+    if groups:
+        from .extra_features import extra_features  # imports this module
+        f = pd.concat([f, extra_features(groups, pairs, records, name_stats)], axis=1)
     return f
 
 
