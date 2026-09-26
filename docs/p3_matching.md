@@ -731,6 +731,62 @@ number of shards grows.
 Three mutations are all caught by these tests: no base priority, all K=50 rows treated as deep, and deep threshold
 ignored.
 
+### Production M3 + meta decoder (the 0.9574 system)
+
+`python -m src.pipeline.predict_hybrid` now defaults to `--decoder meta`, the strictly nested 0.9574 system.
+
+**Definitions and bundle:**
+- `src/pipeline/meta_decoder.py` is the single definition of the meta-model's inputs and decision. It builds the
+  per-row S1 context over all of the S1's Hybrid50 rows and the meta matrix, and applies the production decision:
+  base winners by meta score ≥ `t_base`, then deep winners ≥ `t_deep` on candidates the base did not take.
+- `src/pipeline/train_meta.py` builds the production bundle `output/candidates_p3/hybrid_meta.pkl` (git-ignored)
+  from cached artifacts only, in 111 s: 25 s to load the caches and build the matrix, 86 s for the meta CV and the
+  final fit. The bundle holds:
+  - both M3 first-stage matchers;
+  - the meta-model, its feature list, the meta floor and version;
+  - the thresholds (base 0.69, deep 0.67), tuned on 5-fold meta OOF over all development S1;
+  - the hybrid configuration (20/50/50);
+  - the first-stage SHA-256s and the feature-cache fingerprints.
+
+**Checks built into training (both hold):**
+- The production meta matrix is identical to the development experiment's matrix.
+- The production decision function is identical to the experiment's decision engine on the development OOF.
+- The cross-fitted development estimate is **0.9574** (+0.0016 ± 0.0004 over M3 alone, CI [+0.0007, +0.0025]),
+  equal to the strictly nested 0.9574.
+
+**Inference (`predict_hybrid_meta`):**
+- It runs pass 1 (cross-entity top-2) for both runs.
+- One joint pass then walks the paired K=20/K=50 shards. Spawn-safe workers return the first-stage probabilities
+  and the feature rows of rows ≥ 0.02.
+- The parent computes each S1's context and the meta score, and keeps float64 global winners per stage.
+- Outputs go through the same writer and subset check as before.
+
+**Equivalence:** `hybrid_equivalence` (`--decoder meta`) re-derives both files by scoring every pair in memory and
+applying the meta decoder over the whole run at once (vectorised exclusivity).
+
+| Smoke set | Base / deep matches | Meta rows | `matching_results.tsv` | `candidate_pairs.tsv` | Validator | Production runtime (2 workers) |
+|---|---|---|---|---|---|---|
+| 5k | 16,162 / 358 | 25,063 | identical | identical | PASS | 200 s (CPU shared with a training job) |
+| 50k | 161,281 / 3,360 | 246,310 | offline reference re-run pending (the first attempt hit an O(n²) `np.isin` on string ids in the reference path, now fixed) | | | 448 s (CPU shared) |
+
+**Tests:** `tests/test_meta_decoder.py` covers:
+- context features against a loop reference, with ties;
+- the meta-floor row check;
+- the vectorised decision against streaming float64 winners across shards;
+- an end-to-end run on two real P2 runs that must equal the offline reference, and be identical for 1 and 2
+  workers;
+- official-file properties and the bundle version check.
+
+**Feature caches** (`src/matching/feature_cache.py`): experiments load the 61-feature development matrices in
+1.3 s (K=20) and 1.7 s (K=50) instead of featurizing, which took 334–560 s. A cache is reused only if its
+fingerprint matches:
+- feature version and groups;
+- the candidate run's `run.json`;
+- the S1-sample hash;
+- the size and first-MiB hash of each training source file.
+
+The two existing caches were adopted after their rows and columns were verified.
+
 ## Reproduce
 
 ```

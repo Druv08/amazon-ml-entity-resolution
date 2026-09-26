@@ -76,10 +76,11 @@ class TopTwo:
 
 
 class Winners:
-    """Global exclusivity state: per candidate the best (prob desc, s1_rank asc, row asc) seen so far."""
+    """Global exclusivity state: per candidate the best (prob desc, s1_rank asc, row asc) seen so far.
+    dtype: float32 for first-stage probabilities (as matcher.to_matches), float64 for meta-model scores."""
 
-    def __init__(self, n):
-        self.prob = np.full(n, -np.inf, dtype=np.float32)
+    def __init__(self, n, dtype=np.float32):
+        self.prob = np.full(n, -np.inf, dtype=dtype)
         self.s1 = np.full(n, _BIG, dtype=np.int64)
         self.row = np.full(n, _BIG, dtype=np.int64)
 
@@ -87,7 +88,7 @@ class Winners:
         keys = np.asarray(keys, dtype=np.int64)
         if not len(keys):
             return
-        p = np.asarray(prob, dtype=np.float32)
+        p = np.asarray(prob, dtype=self.prob.dtype)
         r, i = np.asarray(s1_rank, dtype=np.int64), np.asarray(rows, dtype=np.int64)
         o = np.lexsort((i, r, -p, keys))  # per key: best prob, then smallest s1, then earliest row
         first = np.r_[True, keys[o][1:] != keys[o][:-1]]
@@ -99,10 +100,11 @@ class Winners:
         self.prob[k], self.s1[k], self.row[k] = np_[better], ns[better], nr[better]
 
     def accepted(self, threshold):
-        """Keys whose global winner clears the threshold (float32 comparison, as matcher.to_matches)."""
+        """Keys whose global winner clears the threshold, compared in the stored dtype (float32 for probabilities,
+        as matcher.to_matches)."""
         if threshold <= 0:
             raise ValueError("threshold must be > 0 (a non-winner has probability 0 in exclusive())")
-        return np.flatnonzero(self.prob >= np.float32(threshold))
+        return np.flatnonzero(self.prob >= self.prob.dtype.type(threshold))
 
 
 def s1_ranks(s1_ids):
@@ -163,6 +165,33 @@ def _probabilities(model, pairs, records, xt, name_stats, rows=None):
     return model["model"].predict_proba(X)[:, 1].astype(np.float32)
 
 
+def _scores_features(model, pairs, records, xt, name_stats, rows=None, floor=0.0, extra=()):
+    """_probabilities() plus the feature rows (float32, model["features"] order, then the ``extra`` groups: "decoy" =
+    src/matching/decoy_features.py) of the scored rows whose probability is >= floor
+    -> (prob, keep mask over the scored rows, X[keep]). Used by the second-stage (meta) decoder."""
+    groups = tuple(model.get("feature_groups", ()))
+    X = build_features(pairs, records, model["tfidf"], xt, groups, name_stats)[model["features"]]
+    sel = pairs
+    if rows is not None:
+        X, sel = X[np.asarray(rows, dtype=bool)], pairs[np.asarray(rows, dtype=bool)]
+    n_extra = 0
+    if "decoy" in extra:
+        from .decoy_features import FEATURES as DECOY
+
+        n_extra = len(DECOY)
+    if not len(X):
+        return (np.zeros(0, dtype=np.float32), np.zeros(0, dtype=bool),
+                np.zeros((0, X.shape[1] + n_extra), dtype=np.float32))
+    p = model["model"].predict_proba(X)[:, 1].astype(np.float32)
+    keep = p.astype(np.float64) >= floor  # the same float64 comparison as meta_decoder.meta_scores
+    out = X.to_numpy(dtype=np.float32)[keep]
+    if n_extra:
+        from .decoy_features import decoy_features
+
+        out = np.hstack([out, decoy_features(sel[keep], records).to_numpy(dtype=np.float32)])
+    return p, keep, out
+
+
 # ---------------------------------------------------------------- worker processes (spawn-safe, module level)
 _W = {}
 
@@ -184,6 +213,22 @@ def _pass2_task(args):
     return _probabilities(_W["model"], pairs, records, xt, _W["name_stats"], rows)
 
 
+def _init_role_worker(models, name_stats_path):
+    """Workers holding several matchers by role (e.g. {"base": K=20 matcher, "deep": K=50 matcher})."""
+    _init_worker(None, name_stats_path)
+    _W["models"] = models
+
+
+def _role_pass1_task(args):
+    role, pairs, records = args
+    return _cross_scores(_W["models"][role], pairs, records)
+
+
+def _role_pass2_task(args):
+    role, pairs, records, xt, rows, floor, extra = args
+    return _scores_features(_W["models"][role], pairs, records, xt, _W["name_stats"], rows, floor, extra)
+
+
 def _ordered(executor, fn, tasks, window):
     """(meta, result) in task order with at most ``window`` tasks in flight (bounded memory, deterministic order)."""
     queue = deque()
@@ -203,6 +248,42 @@ def split_ids(tables):
                                tables[3]["entity_id"].to_numpy(dtype=object)])
     s1_all = tables[1]["entity_id"].to_numpy(dtype=object)
     return cand_ids, s1_all, s1_ranks(s1_all)
+
+
+def pass1_tops(store, model, index, executor=None, window=2, log=print, role=None):
+    """Pass 1: {score column: TopTwo} = every candidate's two best cross-entity scores over ALL S1 of the store.
+    role: the matcher's key when the executor's workers hold several matchers (_init_role_worker)."""
+    n_shards = len(store.shard_paths)
+
+    def tasks():
+        for df in store.iter_frames(with_records=True):
+            pairs, records = from_store(df)
+            args = (pairs, records) if role is None else (role, pairs, records)
+            yield index.keys(df["candidate_source"], df["candidate_row"]), args
+
+    if executor is None:
+        results = ((keys, _cross_scores(model, *args[-2:])) for keys, args in tasks())
+    else:
+        results = _ordered(executor, _pass1_task if role is None else _role_pass1_task, tasks(), window)
+    tops = {}
+    for i, (keys, scores) in enumerate(results):
+        for c, v in scores.items():
+            if c not in tops:
+                tops[c] = TopTwo(index.n, v.dtype if v.dtype.kind == "f" else np.float64)
+            tops[c].update(keys, v)  # raises if a shard's dtype differs (values must stay exact)
+        if i % 100 == 0:
+            log(f"  pass 1: shard {i}/{n_shards}")
+    return tops
+
+
+def name_stats_file(name_stats):
+    """Temp pickle of the NameStats for spawn workers (None -> None). The caller removes it."""
+    if name_stats is None:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".pkl", prefix="namestats_")
+    with os.fdopen(fd, "wb") as fh:
+        pickle.dump(name_stats, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    return path
 
 
 def stream_winners(store, model, log=print, workers=1, select=None, name_stats=None):
@@ -229,29 +310,11 @@ def stream_winners(store, model, log=print, workers=1, select=None, name_stats=N
 
     executor, ns_path = None, None
     if workers > 1:
-        if name_stats is not None:
-            fd, ns_path = tempfile.mkstemp(suffix=".pkl", prefix="namestats_")
-            with os.fdopen(fd, "wb") as fh:
-                pickle.dump(name_stats, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        ns_path = name_stats_file(name_stats)
         executor = ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(model, ns_path))
     window = 2 * workers
     try:
-        def pass1_tasks():
-            for df in store.iter_frames(with_records=True):
-                yield index.keys(df["candidate_source"], df["candidate_row"]), from_store(df)
-
-        if executor is None:
-            results1 = ((keys, _cross_scores(model, *pr)) for keys, pr in pass1_tasks())
-        else:
-            results1 = _ordered(executor, _pass1_task, pass1_tasks(), window)
-        tops = {}
-        for i, (keys, scores) in enumerate(results1):
-            for c, v in scores.items():
-                if c not in tops:
-                    tops[c] = TopTwo(index.n, v.dtype if v.dtype.kind == "f" else np.float64)
-                tops[c].update(keys, v)  # raises if a shard's dtype differs (values must stay exact)
-            if i % 100 == 0:
-                log(f"  pass 1: shard {i}/{n_shards}")
+        tops = pass1_tops(store, model, index, executor, window, log)
 
         def pass2_tasks():
             for path, df in zip(paths, store.iter_frames(with_records=True)):

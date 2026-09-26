@@ -1,8 +1,14 @@
-"""Production Hybrid50 inference: frozen K=20 base decisions + confident deep K=50 matches -> the official outputs.
+"""Production Hybrid50 inference -> the official outputs.
 
     python -m src.blocking.generate_candidates --split test --top-k 20 --out-dir output/candidates_k20 --no-tsv
     python -m src.blocking.generate_candidates --split test --top-k 50 --out-dir output/candidates_k50 --no-tsv
+    python -m src.pipeline.train_meta              # once: the production bundle (development artifacts only)
     python -m src.pipeline.predict_hybrid          # -> output/matching_results.tsv + output/candidate_pairs.tsv
+
+Default decoder "meta" (the adopted system, predict_hybrid_meta): both matchers of the bundle score their runs; a
+joint pass over the paired K=20 / K=50 shards gives every Hybrid50 row of an S1 its first-stage probability and
+features, the meta-model (src/pipeline/meta_decoder.py) re-scores the rows, and the decision is the one below with
+the meta score and the bundle's two thresholds. Decoder "threshold" (predict_hybrid) is the earlier rule:
 
 Stage 1  base: the improved K=20 matcher streams the exact K=20 candidates (src/matching/stream.py): global
          exclusivity, then its threshold. These assignments are frozen.
@@ -33,9 +39,12 @@ import pyarrow.parquet as pq
 from src.blocking.handoff import CandidateStore
 from src.matching.extra_features import NameStats
 from src.matching.matcher import check_top_k
-from src.matching.stream import Assignments, split_ids, stream_winners
+from src.matching.matcher import from_store
+from src.matching.stream import (Assignments, CandidateIndex, Winners, _init_role_worker, _ordered, _role_pass2_task,
+                                 _scores_features, name_stats_file, pass1_tops, split_ids, stream_winners)
 from src.pipeline.deep_recovery import DEEP_THRESHOLD
 from src.pipeline.hybrid import hybrid_candidates
+from src.pipeline.meta_decoder import META_VERSION, meta_scores
 
 SHARD_COLS = ["s1_row", "rank", "candidate_entity_id"]
 
@@ -176,6 +185,97 @@ def predict_hybrid(base_store, deep_store, base_model, deep_model, matching_path
             "seconds": round(time.time() - t0, 1)}
 
 
+def predict_hybrid_meta(base_store, deep_store, bundle, matching_path, candidate_path, workers=2, log=print):
+    """The adopted system: M3 first stage + meta-model decoder on the Hybrid50 rows (see the module docstring)."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    t0 = time.time()
+    if bundle.get("meta_version") != META_VERSION:
+        raise ValueError(f"bundle version {bundle.get('meta_version')} != {META_VERSION}; re-run train_meta")
+    models = {"base": bundle["base_matcher"], "deep": bundle["deep_matcher"]}
+    cap, floor, extra = bundle["hybrid"]["cap"], bundle["meta_floor"], tuple(bundle.get("meta_extra", ()))
+    t_base, t_deep = bundle["thresholds"]["base"], bundle["thresholds"]["deep"]
+    pairing = pair_runs(base_store, deep_store)
+    check_top_k(models["base"]["top_k"], base_store.meta["config"]["top_k"], base_store.split)
+    check_top_k(models["deep"]["top_k"], deep_store.meta["config"]["top_k"], deep_store.split)
+    tables = base_store.source_tables()
+    index = CandidateIndex(len(tables[2]), len(tables[3]))
+    cand_ids, s1_all, rank = split_ids(tables)
+    groups = set(models["base"].get("feature_groups", ())) | set(models["deep"].get("feature_groups", ()))
+    name_stats = NameStats.from_tables(tables) if "E" in groups else None
+    executor, ns_path = None, None
+    if workers > 1:
+        ns_path = name_stats_file(name_stats)
+        executor = ProcessPoolExecutor(max_workers=workers, initializer=_init_role_worker, initargs=(models, ns_path))
+    window = 2 * workers
+    try:
+        tops = {}
+        for role, store in (("base", base_store), ("deep", deep_store)):
+            log(f"pass 1: {role} run (K={store.meta['config']['top_k']})")
+            tops[role] = pass1_tops(store, models[role], index, executor, window, log,
+                                    role=role if executor is not None else None)
+        select = DeepRows(pairing, cap)
+
+        def tasks():
+            it = zip(base_store.shard_paths, deep_store.shard_paths, base_store.iter_frames(with_records=True),
+                     deep_store.iter_frames(with_records=True))
+            for base_path, deep_path, dfb, dfd in it:
+                if pairing[deep_path] != base_path:
+                    raise ValueError("base and deep shards are not aligned")
+                for role, df, path in (("base", dfb, base_path), ("deep", dfd, deep_path)):
+                    keys = index.keys(df["candidate_source"], df["candidate_row"])
+                    rows = None if role == "base" else np.asarray(select(path, df), dtype=bool)
+                    pairs, records = from_store(df)
+                    xt = {c: t.frame(keys, pairs["cand_id"]) for c, t in tops[role].items()}
+                    meta = (role, keys, df["s1_row"].to_numpy(), df["rank"].to_numpy(), rows)
+                    yield meta, (role, pairs, records, xt, rows, floor, extra)
+
+        if executor is None:
+            results = ((m, _scores_features(models[m[0]], pr, rec, xt, name_stats, rows, fl, ex))
+                       for m, (_, pr, rec, xt, rows, fl, ex) in tasks())
+        else:
+            results = _ordered(executor, _role_pass2_task, tasks(), window)
+        log("pass 2: paired shards -> first stage -> meta-model")
+        wins = {0: Winners(index.n, np.float64), 1: Winners(index.n, np.float64)}
+        row0, n = 0, {"base_pairs": 0, "deep_pairs": 0, "deep_rows_scored": 0, "meta_rows": 0}
+        it = iter(results)
+        for i, ((mb, (pb, _, xb)), (md, (pd_, _, xd))) in enumerate(zip(it, it)):
+            if mb[0] != "base" or md[0] != "deep":
+                raise RuntimeError("paired results out of order")
+            rows = md[4]
+            n["base_pairs"] += len(mb[1])
+            n["deep_pairs"] += len(md[1])
+            n["deep_rows_scored"] += int(rows.sum())
+            keys = np.concatenate([mb[1], md[1][rows]])
+            s1 = np.concatenate([mb[2], md[2][rows]])
+            rk = np.concatenate([mb[3], md[3][rows]])
+            prob = np.concatenate([pb, pd_]).astype(np.float64)
+            origin = np.r_[np.zeros(len(pb), dtype=np.int64), np.ones(len(pd_), dtype=np.int64)]
+            score = meta_scores(bundle["meta_model"], prob, origin, rk, s1, np.vstack([xb, xd]),
+                                bundle["pair_features"], floor)
+            at = row0 + np.arange(len(prob))
+            row0 += len(prob)
+            ok = score > -np.inf
+            n["meta_rows"] += int(ok.sum())
+            for o in (0, 1):
+                m = ok & (origin == o)
+                wins[o].update(keys[m], score[m], rank[s1[m]], at[m])
+            if i % 100 == 0:
+                log(f"  pass 2: shard pair {i}/{len(pairing)}")
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        if ns_path:
+            os.remove(ns_path)
+    keys, owner, is_deep = hybrid_assignments(wins[0], t_base, wins[1], t_deep)
+    log("outputs")
+    n_s1 = base_store.meta["s1_limit"] or len(s1_all)
+    st = write_outputs(matching_path, candidate_path, Assignments(owner, cand_ids[keys]),
+                       iter_hybrid_lists(pairing, cap, n_s1), s1_all[:n_s1], rank[:n_s1])
+    return {**st, **n, "base_matches": int((~is_deep).sum()), "deep_matches": int(is_deep.sum()),
+            "decoder": "meta", "thresholds": bundle["thresholds"], "cap": cap, "seconds": round(time.time() - t0, 1)}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--split", default="test")
@@ -187,17 +287,26 @@ def main(argv=None):
     ap.add_argument("--deep-threshold", type=float, default=DEEP_THRESHOLD)
     ap.add_argument("--workers", type=int, default=2, help="scoring processes; output identical for any value")
     ap.add_argument("--out", default="output")
+    ap.add_argument("--decoder", choices=["meta", "threshold"], default="meta",
+                    help="meta: the adopted M3 + meta-model system (needs --bundle); threshold: the earlier rule")
+    ap.add_argument("--bundle", default="output/candidates_p3/hybrid_meta.pkl", help="written by train_meta")
     a = ap.parse_args(argv)
     t0 = time.time()
-    models = []
-    for path in (a.base_model, a.deep_model):
-        with open(path, "rb") as fh:
-            models.append(pickle.load(fh))
+    log = lambda msg: print(f"{msg}, {time.time() - t0:.0f}s", flush=True)  # noqa: E731
     base = CandidateStore(a.split, out_dir=a.base_cands)
     deep = CandidateStore(a.split, out_dir=a.deep_cands, data_dir=base.data_dir, tables=base.source_tables())
-    r = predict_hybrid(base, deep, *models, os.path.join(a.out, "matching_results.tsv"),
-                       os.path.join(a.out, "candidate_pairs.tsv"), cap=a.cap, deep_threshold=a.deep_threshold,
-                       workers=a.workers, log=lambda msg: print(f"{msg}, {time.time() - t0:.0f}s", flush=True))
+    paths = os.path.join(a.out, "matching_results.tsv"), os.path.join(a.out, "candidate_pairs.tsv")
+    if a.decoder == "meta":
+        with open(a.bundle, "rb") as fh:
+            bundle = pickle.load(fh)
+        r = predict_hybrid_meta(base, deep, bundle, *paths, workers=a.workers, log=log)
+    else:
+        models = []
+        for path in (a.base_model, a.deep_model):
+            with open(path, "rb") as fh:
+                models.append(pickle.load(fh))
+        r = predict_hybrid(base, deep, *models, *paths, cap=a.cap, deep_threshold=a.deep_threshold,
+                           workers=a.workers, log=log)
     with open(os.path.join(a.out, "hybrid_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(r, fh, indent=2)
     print(json.dumps(r))

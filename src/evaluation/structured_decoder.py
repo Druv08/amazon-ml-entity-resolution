@@ -381,7 +381,7 @@ def meta(out=f"{OUT_DIR}/structured_15c.json"):
     return res
 
 
-def strict_meta(first="M0", log=print):
+def strict_meta(first="M0", decoy=False, first_decoy=False, log=print):
     """Strictly nested version of the pair-feature meta-model: for every outer fold k the FIRST-STAGE K=20 and K=50
     matchers are retrained without fold k (inner 4-fold OOF for the training S1, a model on all four folds for fold
     k), so no model, threshold or meta-model that touches fold k ever saw a fold-k label. The same framework gives
@@ -389,7 +389,8 @@ def strict_meta(first="M0", log=print):
     from src.matching.ensemble_experiment import MODELS, feature_cache
     from src.matching.matcher import train
 
-    out = f"{OUT_DIR}/structured_15c_strict_{first}.json"
+    tag = first + ("_decoy" if decoy else "") + ("_firstdecoy" if first_decoy else "")
+    out = f"{OUT_DIR}/structured_15c_strict_{tag}.json"
     params = MODELS[first]  # first-stage matcher configuration (checkpoint 14)
     ctx = HybridDev(native=False)
     p20_ref = pd.read_parquet("output/candidates_p3/k20/oof.parquet", columns=["prob"])["prob"].to_numpy()
@@ -402,6 +403,12 @@ def strict_meta(first="M0", log=print):
         if not (np.array_equal(m["s1_id"].to_numpy(), k["s1_id"].to_numpy())
                 and np.array_equal(m["cand_id"].to_numpy(), k["cand_id"].to_numpy())):
             raise ValueError("feature cache rows are not aligned with the OOF rows")
+    if decoy or first_decoy:  # token-alignment features (src/matching/decoy_features.py), all rows, cached
+        from src.evaluation.decoy_experiment import all_row_decoy_features
+
+        D20, D50 = all_row_decoy_features(ctx)
+    if first_decoy:
+        X20, X50 = pd.concat([X20, D20], axis=1), pd.concat([X50, D50], axis=1)
     s1_fold = dict(zip(T0.s1_ids, T0.fold))
     f20 = ctx.k20["s1_id"].map(s1_fold).to_numpy()
     f50 = ctx.k50["s1_id"].map(s1_fold).to_numpy()
@@ -429,6 +436,12 @@ def strict_meta(first="M0", log=print):
                                        .mean(), [0.70])[0][0]
         rows = np.flatnonzero(T.prob >= META_FLOOR)
         M = meta_matrix(T, rows, pair_features=True)
+        if decoy:
+            b = T.origin[rows] == 0
+            Dr = np.empty((len(rows), D20.shape[1]), dtype=np.float32)
+            Dr[b] = D20.to_numpy()[T.src_row[rows][b]]
+            Dr[~b] = D50.to_numpy()[T.src_row[rows][~b]]
+            M = pd.concat([M, pd.DataFrame(Dr, columns=D20.columns)], axis=1)
         y, fr = T.label[rows], T.row_fold[rows]
         inner = np.full(len(T.prob), -np.inf)
         for j in range(5):
@@ -450,7 +463,8 @@ def strict_meta(first="M0", log=print):
     thr_m = np.where(TF.origin == 0, tm[TF.row_fold, 0], tm[TF.row_fold, 1])
     acc_m = TF.decide(thr_m, score=score_fin)
     per_m = TF.f05(acc_m)
-    res = {"first_stage": first, "adopted_reference": TF.summary(ref, acc=None),
+    res = {"first_stage": first, "decoy_meta": decoy, "decoy_first_stage": first_decoy,
+           "adopted_reference": TF.summary(ref, acc=None),
            "strict baseline (first stage, t20 per fold, deep 0.85)": TF.summary(per_b, ref=ref, acc=acc_b),
            "strict meta (prob + S1 context + pair features)": TF.summary(per_m, ref=ref, acc=acc_m),
            "strict meta vs strict baseline": TF.summary(per_m, ref=per_b),
@@ -460,6 +474,10 @@ def strict_meta(first="M0", log=print):
         m = TF.random & (TF.fold == f)
         per_fold[f] = round(float((per_m - per_b)[m].mean()), 5)
     res["meta_minus_baseline_per_fold"] = per_fold
+    # per-row held-out decisions (git-ignored) for the oracle-gap audit (src/evaluation/oracle_gap.py)
+    TF.frame.assign(first_prob=TF.prob, meta_score=score_fin, meta_threshold=thr_m, accepted=acc_m,
+                    base_threshold=thr_b, base_accepted=acc_b, fold=TF.row_fold).to_parquet(
+        f"{OUT_DIR}/strict_rows_{tag}.parquet")
     for k_, v in res.items():
         print(f"{k_}: {json.dumps(v)}", flush=True)
     with open(out, "w", encoding="utf-8") as fh:
@@ -635,10 +653,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("stage", choices=["analyze", "adaptive", "meta", "strict_meta", "count", "competition"])
     ap.add_argument("--first", default="M0", help="strict_meta: first-stage model of checkpoint 14 (M0-M3)")
+    ap.add_argument("--decoy", action="store_true", help="strict_meta: token-alignment features in the meta-model")
+    ap.add_argument("--first-decoy", action="store_true", help="strict_meta: ... and in the first-stage matchers")
     a = ap.parse_args(argv)
     t0 = time.time()
     if a.stage == "strict_meta":
-        strict_meta(a.first)
+        strict_meta(a.first, decoy=a.decoy, first_decoy=a.first_decoy)
     else:
         {"analyze": analyze, "adaptive": adaptive, "meta": meta, "count": count, "competition": competition}[a.stage]()
     print(f"{time.time() - t0:.0f}s")

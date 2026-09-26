@@ -22,27 +22,13 @@ import pandas as pd  # before sklearn (Windows: pyarrow after sklearn can crash)
 import numpy as np
 from sklearn.model_selection import GroupKFold
 
+from src.matching.feature_cache import feature_cache  # noqa: F401  (fingerprinted cache)
 from src.matching.matcher import train
 from src.matching.sample_candidates import OUT
 
 MODELS = {"M0": {}, "M1": dict(learning_rate=0.03, max_iter=800), "M2": dict(max_leaf_nodes=15),
           "M3": dict(max_leaf_nodes=63)}
 GROUPS = ("A", "C", "E")
-
-
-def feature_cache(cands):
-    """(meta frame s1_id/cand_id/rank/label, X float32) of a development run, built once with train.featurize."""
-    path = os.path.join(cands, "X_ACE.parquet")
-    if not os.path.exists(path):
-        from src.matching.train import featurize, load
-
-        pairs, records, truth, s1, claimed, _ = load(cands)
-        X, y, _, _ = featurize(pairs, records, claimed, GROUPS)
-        X.assign(**{"__" + c: pairs[c].to_numpy() for c in ("s1_id", "cand_id", "rank", "label")}).to_parquet(path)
-    f = pd.read_parquet(path)
-    meta_cols = [c for c in f.columns if c.startswith("__")]
-    meta = f[meta_cols].rename(columns=lambda c: c[2:])
-    return meta, f.drop(columns=meta_cols)
 
 
 def make_oof(cands, names, log=print):
