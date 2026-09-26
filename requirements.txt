@@ -1,5 +1,8 @@
-# Tested with Python 3.13. All packages are permissively licensed (BSD / Apache-2.0).
-pandas==3.0.2
-numpy==2.4.3
+# Tested with Python 3.13 and 3.14. All packages are permissively licensed (BSD / Apache-2.0 / MIT).
+pandas==3.0.3
+numpy==2.4.4
 scipy==1.17.0
 pyarrow==24.0.0
+rapidfuzz==3.14.6
+scikit-learn==1.9.0
+matplotlib==3.10.9
