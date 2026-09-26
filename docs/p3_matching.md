@@ -574,6 +574,60 @@ to describe FPs. The city S1 (every S1 of two cities is sampled) are the competi
   FPs (53 → 45). The full test, where every owner is present, should gain somewhat over the development estimate,
   probably well under +0.001. It cannot be measured without full-split blocking.
 
+### Oracle gap: where the remaining macro-F0.5 goes
+
+`python -m src.evaluation.oracle_gap` (40 s from cached artifacts) takes the strictly nested held-out decisions of
+the 0.9574 system and places every lost bit of per-S1 F0.5. Random development S1:
+
+| Oracle ladder | macro-F0.5 |
+|---|---|
+| O0 current (M3 + meta, strictly nested) | 0.9574 |
+| O1 perfect per-S1 cut on the current score order | 0.9831 |
+| O1′ perfect cut on the M3 probability order | 0.9828 |
+| O2 perfect selection among Hybrid50 candidates (ceiling) | 0.9874 |
+| O3 perfect selection among Hybrid50 + K=100 candidates | 0.9897 |
+| O4 ground truth | 1.0 |
+
+Per S1 the loss telescopes: total 0.0426 = **cut 0.0257** (O1 − O0) + **blocking 0.0126** (1 − O2) +
+**ranking 0.0043** (O2 − O1). The same split by group:
+
+| Group | S1 | O0 | Blocking | Ranking | Cut |
+|---|---|---|---|---|---|
+| India | 7,945 | 0.9446 | 0.0207 | 0.0040 | 0.0307 |
+| US | 11,874 | 0.9659 | 0.0073 | 0.0045 | 0.0224 |
+| 0 true matches | 1,060 | 0.9557 | – | – | 0.0443 |
+| 1 | 1,030 | 0.8684 | 0.0418 | 0.0094 | 0.0805 |
+| 2 | 3,406 | 0.9434 | 0.0162 | 0.0055 | 0.0349 |
+| 3 | 4,777 | 0.9624 | 0.0112 | 0.0044 | 0.0221 |
+| 4+ | 9,546 | 0.9696 | 0.0103 | 0.0037 | 0.0163 |
+
+Every error falls in exactly one class. "Recoverable" is the macro-F0.5 gain if only that class were fixed:
+
+| Error source | Pairs | S1 affected | Loss of affected S1 (macro share) | Max recoverable |
+|---|---|---|---|---|
+| FN, true candidate ranked above every false one but below the threshold | 2,558 | 2,244 | 0.0155 | **+0.0143** |
+| FN, missing from the candidates (blocking) | 2,382 | 1,920 | 0.0160 | +0.0141 |
+| FP, every present true ranked above it (threshold too low for this S1) | 581 | 552 | 0.0071 | +0.0067 |
+| FN, outranked by a false candidate of the S1 | 517 | 476 | 0.0047 | +0.0033 |
+| FP, singleton S1 | 59 | 47 | 0.0024 | +0.0024 |
+| FP, outranks a true candidate of the S1 | 242 | 237 | 0.0029 | +0.0024 |
+| FN, below the meta floor (first stage < 0.02) | 317 | 304 | 0.0024 | +0.0019 |
+| FN, lost to exclusivity | 9 | 9 | 0.0001 | +0.0000 |
+| (S1-level) multi-match S1 with partial recovery | 3,204 | 4,342 | 0.0225 | +0.0123 |
+
+Rank 1–20 rows carry most cut errors; deep rows carry most below-floor FNs. Among the missing pairs, 421 have a
+native-script candidate and 749 a missing candidate address.
+
+**The cut is not the real lever.** An expected-F0.5 set decoder (`src/evaluation/set_decoder.py`) picks each S1's
+cut to maximise its expected F0.5, computed exactly with Poisson-binomial dynamic programming on calibrated
+probabilities. It gains only +0.0002 ± 0.0004 over the threshold rule, so the threshold is already the best cut the
+scores allow.
+
+O1's +0.026 exists only because the oracle uses labels to separate candidates that have the *same* score. The
+bottleneck is therefore **discrimination inside the uncertain band**. Inspecting that band shows generated decoys
+against corrupted true duplicates (see "Token-alignment features" below). Similarity to the S1's confident matches
+does not separate them either (AUC 0.48–0.60).
+
 ### S1-level no-match gate (negative result, not adopted)
 
 The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
