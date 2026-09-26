@@ -386,6 +386,102 @@ Findings:
 
 The production first-stage choice (M3) is decided together with checkpoint 15 below.
 
+### Structured decisions on top of the pair probabilities (checkpoint 15)
+
+`src/evaluation/structured_decoder.py` works on one row per Hybrid50 candidate:
+- K=20 rows carry the K=20 OOF probability; deep rows carry the K=50 OOF probability.
+- A decoder gives each row a score and a threshold, and keeps the production structure: base exclusivity, base
+  priority, deep exclusivity.
+- The vectorised decision engine reproduces the adopted 0.95248 exactly, and `tests/test_structured_decoder.py`
+  checks it against `base_predictions` + `merge_deep` + per-S1 F0.5.
+- **Cross-fitting:** S1 fall into the K=20 matcher's five GroupKFold folds. Every tuned parameter or model used for
+  a fold is fitted on the other four folds, and results are pooled over the held-out folds.
+
+**15A: per-S1 structure** (random S1, by number of true matches):
+
+| True matches | S1 | top1 | top2 | top3 | S1 accepted | F0.5 |
+|---|---|---|---|---|---|---|
+| 0 | 1,060 | 0.195 | 0.065 | 0.021 | 0.09 | 0.927 |
+| 1 | 1,030 | 0.912 | 0.143 | 0.036 | 0.96 | 0.886 |
+| 2 | 3,406 | 0.980 | 0.856 | 0.139 | 1.86 | 0.940 |
+| 3 | 4,777 | 0.993 | 0.960 | 0.808 | 2.77 | 0.957 |
+| 4+ | 9,546 | 0.997 | 0.989 | 0.959 | 4.46 | 0.965 |
+
+- **The count dimension is nearly solved already.** The number of accepted candidates tracks the true count.
+- **Oracle bound:** told each S1's true count and taking its top-N winners by probability, the decoder reaches only
+  **0.9533 (+0.0008)**.
+- **So the remaining errors are about *which* candidates, not *how many*.**
+
+**15B: adaptive thresholds** (cross-fitted coordinate descent over a 0.30–0.98 grid; small predefined variants):
+
+| Decoder | macro-F0.5 | Δ vs 0.9525 (±SE) [95% CI] | India | US | Singletons | Rule (per-fold parameters) |
+|---|---|---|---|---|---|---|
+| uniform t20, deep 0.85 | 0.9524 | −0.0001 ± 0.0002 [−0.0004, +0.0002] | 0.9389 | 0.9614 | 0.927 | t20 0.68–0.72 |
+| uniform t20 + tuned deep | 0.9522 | −0.0003 ± 0.0002 | 0.9385 | 0.9614 | 0.926 | deep 0.63–0.77 |
+| rank 1–3 / rank 4–20 / deep | 0.9522 | −0.0003 ± 0.0002 | 0.9386 | 0.9613 | 0.926 | 0.68–0.72 / 0.69–0.72 / 0.63–0.77 |
+| first vs additional match / deep | 0.9519 | −0.0006 ± 0.0003 [−0.0011, −0.0000] | 0.9374 | 0.9616 | 0.933 | |
+
+- **The adopted threshold carries almost no tuning optimism:** a cross-fitted uniform threshold loses only 0.0001.
+- **Extra threshold parameters only fit noise.** No native-script or address-contradiction thresholds were tried,
+  because the error analysis showed no FP/FN asymmetry to justify them.
+
+**15D: match-count decoder.** An HGB classifier predicts each S1's count bucket (0/1/2/3/4+) from S1 aggregates of
+the first-stage probabilities: top-6 probabilities, gaps, counts above 0.1–0.9, probability sum, and the country.
+It is cross-fitted by S1.
+- Its count accuracy is 0.835, against 0.814 for the count the adopted rule implies.
+- **Top-N:** accept the predicted number of best winners. **0.9387 (−0.0138).**
+- **Cap:** the adopted decisions, capped at N. **0.9516 (−0.0009 ± 0.0004).**
+- **Cap+fill:** the cap, then filled up to N from winners with prob ≥ 0.5. **0.9490 (−0.0035).**
+
+All three are negative, as the +0.0008 oracle bound predicted.
+
+**15C: second-stage meta-model.** This does not replace the matcher. An HGB pair model is trained on the rows with
+first-stage probability ≥ 0.02; these hold 128,214 rows and 99.6% of true pairs, and the rest are never accepted.
+Its inputs are:
+- the first-stage OOF probability, the origin (base/deep) and the blocker rank;
+- S1 context: top-3 probabilities, counts above 0.3/0.5/0.7/0.9, probability sum, best base/deep probability,
+  position of the row in the S1, and the gap to the S1's best;
+- optionally, the 61 A+C+E pair features.
+
+The cross-fitting is nested. For each outer fold, four inner models give clean scores to tune (t_base, t_deep) on
+the four training folds, and the outer model scores the held-out fold. Decisions keep the production structure,
+with winners by meta score.
+
+| Decoder | macro-F0.5 | Δ vs 0.9525 (±SE) [95% CI] | India | US | Singletons | FP | FN | Rule |
+|---|---|---|---|---|---|---|---|---|
+| current Hybrid50 | 0.9525 | – | 0.9390 | 0.9615 | 0.927 | 950 | 6,575 | t20 0.70, deep 0.85 |
+| meta: prob + S1 context (17 features) | 0.9522 | −0.0003 ± 0.0005 [−0.0012, +0.0006] | 0.9384 | 0.9614 | 0.946 | 1,120 | 6,108 | t_base 0.64–0.70, t_deep 0.52–0.66 |
+| **meta: + pair features (77 features)** | **0.9547** | **+0.0022 ± 0.0005 [+0.0012, +0.0031]** | **0.9407** | **0.9641** | **0.949** | 988 | 5,935 | t_base 0.65–0.71, t_deep 0.60–0.71 |
+
+The pair-feature meta-model has a subtle stacking caveat. The first-stage OOF probabilities of its training rows came
+from models that had seen the held-out fold's labels; this is standard stacking, but not strictly clean. The
+strictly nested re-run is below.
+
+### Competition / ownership (checkpoint 17)
+
+`python -m src.evaluation.structured_decoder competition` uses test-available signals only: the number of claiming
+S1, the best competing claimant's probability and the winner's margin over it. Ground-truth ownership is used only
+to describe FPs. The city S1 (every S1 of two cities is sampled) are the competition-rich context.
+
+| Accepted pairs | Random S1 | City S1 |
+|---|---|---|
+| mean claimants per accepted candidate | 1.11 | 4.64 |
+| accepted candidates with a competing claimant | 9.2% | 64.1% |
+| FPs whose candidate is another S1's true match | 281 of 950 (30%) | 45 of 318 (14%) |
+
+| Ownership rule | Random S1 F0.5 (Δ) | City S1 F0.5 (Δ ± SE) |
+|---|---|---|
+| adopted exclusivity | 0.95248 | 0.95994 |
+| no exclusivity | 0.95248 (0) | 0.95983 (−0.0001 ± 0.0001) |
+| exclusivity + winner margin ≥ 0.05 / 0.1 / 0.2 over the best competitor | 0.95247–0.95249 | +0.0003 / +0.0004 / +0.0003 (± 0.0002) |
+
+- **No margin rule is adopted:** the gains are under 2 SE and there is no effect on the target S1.
+- **Oracle bound (analysis only):** removing every random-S1 FP whose candidate is another S1's true match would give
+  0.9562 (+0.0037).
+- **How much of that full scale delivers:** where owners compete (city S1), exclusivity removes only ~15% of such
+  FPs (53 → 45). The full test, where every owner is present, should gain somewhat over the development estimate,
+  probably well under +0.001. It cannot be measured without full-split blocking.
+
 ### S1-level no-match gate (negative result, not adopted)
 
 The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
