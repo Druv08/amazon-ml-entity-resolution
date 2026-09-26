@@ -337,6 +337,55 @@ Decision: **not adopted.**
 
 Hybrid50 stays the candidate set.
 
+### Model ensemble experiment (checkpoint 14): no ensemble; the 63-leaf model wins alone
+
+`src/matching/ensemble_experiment.py` compares a small, **predefined** set of HGB matchers (no search). Everything
+else is held fixed: the same A+C+E features, the same GroupKFold(5) partitions, the same development sample and the
+same Hybrid50 decision.
+
+| Model | Configuration |
+|---|---|
+| M0 production | lr 0.05, 31 leaves, max_iter 500 |
+| M1 conservative | lr 0.03, 31 leaves, max_iter 800 |
+| M2 simpler | lr 0.05, 15 leaves |
+| M3 richer | lr 0.05, 63 leaves |
+
+Setup details:
+- Every model has its own OOF at K=20 and K=50. The regenerated M0 OOF is bit-identical to the stored production
+  OOF, so training is deterministic.
+- The K=20 threshold is re-tuned per model on development, as `train.py` does; the deep rule stays prob ≥ 0.85.
+- Ensembles combine all four models by arithmetic mean, median, or mean log-odds.
+
+Reproduce: `python -m src.matching.ensemble_experiment oof`, then `... eval`.
+
+Hybrid50 results on the random development S1. Δ is paired against the adopted Hybrid50 (0.9525), with the ±SE
+and a 95% bootstrap CI over S1:
+
+| Model / ensemble | macro-F0.5 | Δ (±SE) [95% CI] | India | US | Singletons | FP | FN | Rank 1–3 FP | Native-script FN | t20 | K=20 alone | Predict s / 1M rows (K=20) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| M0 (production) | 0.9525 | – | 0.9390 | 0.9615 | 0.927 | 950 | 6,575 | 455 | 903 | 0.70 | 0.9494 | 9.4 |
+| M1 | 0.9531 | +0.0006 ± 0.0004 [−0.0002, +0.0013] | 0.9400 | 0.9618 | 0.933 | 861 | 6,657 | 421 | 899 | 0.72 | 0.9497 | 17.0 |
+| M2 | 0.9480 | −0.0045 ± 0.0005 | 0.9332 | 0.9579 | 0.905 | 1,153 | 6,823 | 574 | 917 | 0.68 | 0.9451 | 9.8 |
+| **M3** | **0.9558** | **+0.0033 ± 0.0005 [+0.0024, +0.0042]** | **0.9430** | **0.9644** | **0.937** | **887** | **6,137** | **408** | **824** | 0.70 | **0.9525** | 8.9 |
+| mean of 4 | 0.9537 | +0.0013 ± 0.0003 [+0.0006, +0.0019] | 0.9405 | 0.9626 | 0.936 | 857 | 6,574 | 421 | 885 | 0.70 | 0.9504 | 45.2 |
+| median of 4 | 0.9535 | +0.0010 ± 0.0003 [+0.0004, +0.0015] | 0.9403 | 0.9622 | 0.931 | 893 | 6,534 | 437 | 882 | 0.70 | 0.9501 | 45.2 |
+| mean log-odds of 4 | 0.9537 | +0.0012 ± 0.0003 [+0.0005, +0.0019] | 0.9406 | 0.9624 | 0.933 | 893 | 6,503 | 436 | 872 | 0.70 | 0.9503 | 45.2 |
+
+FN counts include 2,382 true pairs that are not in the candidate set, the same for every model. Training time for
+5 folds: K=20 110 / 214 / 140 / 125 s (M0–M3), K=50 102 / 245 / 164 / 312 s.
+
+Findings:
+- **No ensemble is worth it.** Averaging adds +0.0010–0.0013 for 4× the predict cost, and every ensemble is worse
+  than M3 alone. The weak M2 drags the average down.
+- **M3 is a real improvement, not selection noise.** It gains +0.0033 (7 SE), on both the K=20 base alone and
+  Hybrid50, with India +0.0040 and US +0.0029. It has fewer FPs and fewer FNs; 840 S1 improve and 385 are harmed.
+  Picking the best of 7 options could explain about 2 SE (~0.001), not 7.
+- **Capacity is the lever.** The trend is monotone in capacity: 15 leaves −0.0045, 31 leaves ±0, 63 leaves +0.0033.
+- **Inference cost is unchanged at K=20** (8.9 vs 9.4 s per 1M rows). At K=50 it goes from 4.5 to 9.5 s per 1M rows,
+  because early stopping ends later. Either way it is small next to feature building (~170 CPU-s per 1M pairs).
+
+The production first-stage choice (M3) is decided together with checkpoint 15 below.
+
 ### S1-level no-match gate (negative result, not adopted)
 
 The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
