@@ -1,6 +1,7 @@
 import os
 import re
 import gc
+import time
 import joblib
 import torch
 import numpy as np
@@ -131,16 +132,15 @@ def fill_feature_row(out_arr, row_idx, s1_meta, op_meta, dense_sc, rank_pos, mar
     out_arr[row_idx, 21] = f_composite_addr_dense
 
 @torch.no_grad()
-def encode_to_disk(texts, model, tokenizer, device, file_path, batch_size=512):
-    n_samples = len(texts)
+def load_or_encode_to_disk(texts, n_samples, model, tokenizer, device, file_path, batch_size=512):
     dim = 1024
     expected_bytes = n_samples * dim * 2
 
     if os.path.exists(file_path) and os.path.getsize(file_path) == expected_bytes:
-        print(f"  [Found existing cache] Reusing: {file_path} ({n_samples} vectors)")
+        print(f"  [Found existing cache] Reusing: {file_path} ({n_samples:,} vectors)")
         return np.memmap(file_path, dtype='float16', mode='r', shape=(n_samples, dim))
 
-    print(f"  [Generating cache] Encoding {n_samples} items to {file_path}...")
+    print(f"  [Generating cache] Encoding {n_samples:,} items to {file_path}...")
     mmap = np.memmap(file_path, dtype='float16', mode='w+', shape=(n_samples, dim))
     for i in tqdm(range(0, n_samples, batch_size), desc="Encoding", leave=False):
         b = texts[i:i+batch_size]
@@ -157,6 +157,9 @@ def run_test_inference(target_countries=None):
 
     print("[Loading Models]")
     models = [joblib.load(f"lgb_fold_{f}.pkl") for f in range(5)]
+    for m in models:
+        if hasattr(m, 'set_params'):
+            m.set_params(n_jobs=-1)
 
     print("[Loading Datasets]")
     s1_df = pl.read_csv(os.path.join(DATA_DIR, "test_source1.tsv"), separator="\t")
@@ -182,11 +185,11 @@ def run_test_inference(target_countries=None):
     tok = AutoTokenizer.from_pretrained("BAAI/bge-m3", local_files_only=True)
     mod = AutoModel.from_pretrained("BAAI/bge-m3", torch_dtype=torch.float16, local_files_only=True).to(device).eval()
 
-    def process_df(df):
+    def process_df(df, desc="Processing text"):
         texts, meta = [], []
         names = df["business_name"].to_list()
         addrs = df["business_address"].to_list()
-        for n, a in zip(names, addrs):
+        for n, a in tqdm(zip(names, addrs), total=len(names), desc=desc, leave=False):
             m = extract_meta(n, a)
             meta.append(m)
             texts.append(f"[COL] name [VAL] {m[0][0]} [COL] address [VAL] {str(a or '').lower()}")
@@ -194,6 +197,11 @@ def run_test_inference(target_countries=None):
 
     ANCHOR_THRESH = 0.84
     SISTER_THRESH = 0.76
+
+    S1_BLOCK_SIZE = 50_000
+    OPS_STREAM_BATCH = 16_384
+    EVAL_BATCH_S1 = 40_000
+    N_WORKERS = min(os.cpu_count() or 4, 8)
 
     for country in countries:
         print(f"\n==================================================")
@@ -210,43 +218,51 @@ def run_test_inference(target_countries=None):
         s1_ids = s1_c_df["entity_id"].to_list()
         ops_ids = ops_c_df["entity_id"].to_list()
 
-        s1_texts, s1_meta = process_df(s1_c_df)
-        ops_texts, ops_meta = process_df(ops_c_df)
-        del s1_c_df, ops_c_df
-        gc.collect()
+        ops_names = ops_c_df["business_name"].to_list()
+        ops_addrs = ops_c_df["business_address"].to_list()
 
+        print(f"[*] Pre-processing S1 metadata for {country}...")
+        s1_texts, s1_meta = process_df(s1_c_df, desc="S1 Meta")
+        
         s1_mmap_path = os.path.join(CACHE_DIR, f"s1_{country}.dat")
         ops_mmap_path = os.path.join(CACHE_DIR, f"ops_{country}.dat")
 
-        ops_mmap = encode_to_disk(ops_texts, mod, tok, device, ops_mmap_path, batch_size=512)
-        del ops_texts
+        # The Fix: If cache is missing, parse the text. If it exists, skip parsing entirely.
+        if not os.path.exists(ops_mmap_path):
+            print(f"[*] Missing ops cache for {country}. Processing full text to generate embeddings (One-time cost)...")
+            ops_texts, _ = process_df(ops_c_df, desc="Ops Text Prep")
+            ops_mmap = load_or_encode_to_disk(ops_texts, n_ops, mod, tok, device, ops_mmap_path, batch_size=512)
+            del ops_texts
+        else:
+            ops_mmap = load_or_encode_to_disk([], n_ops, mod, tok, device, ops_mmap_path, batch_size=512)
+
+        s1_mmap = load_or_encode_to_disk(s1_texts, n_s1, mod, tok, device, s1_mmap_path, batch_size=512)
+        
+        del s1_texts, s1_c_df, ops_c_df
         gc.collect()
 
-        s1_mmap = encode_to_disk(s1_texts, mod, tok, device, s1_mmap_path, batch_size=512)
-        del s1_texts
-        gc.collect()
+        # =========================================================================
+        # 1. OPTIMIZED RETRIEVAL PASS 
+        # =========================================================================
+        print(f"\n[GPU Retrieval] Starting optimized GEMM search for {n_s1:,} entities...")
+        t_retrieval_start = time.time()
 
-        # Inverted GPU Top-K Retrieval
         topk_scores_all = np.full((n_s1, 15), -1.0, dtype=np.float32)
         topk_indices_all = np.full((n_s1, 15), -1, dtype=np.int64)
 
-        s1_block_size = min(n_s1, 450_000)
-        ops_stream_batch = 32_768
-
-        for s1_start in range(0, n_s1, s1_block_size):
-            s1_end = min(s1_start + s1_block_size, n_s1)
+        for s1_start in range(0, n_s1, S1_BLOCK_SIZE):
+            s1_end = min(s1_start + S1_BLOCK_SIZE, n_s1)
             cur_s1_len = s1_end - s1_start
-            print(f"\n[GPU Retrieval] Processing S1 slice [{s1_start:,} : {s1_end:,}] ({cur_s1_len:,} entities)...")
 
-            s1_tensor = torch.from_numpy(np.array(s1_mmap[s1_start:s1_end])).to(device=device, dtype=torch.float16)
+            s1_tensor = torch.from_numpy(s1_mmap[s1_start:s1_end]).to(device=device, dtype=torch.float16)
 
             best_scores_gpu = torch.full((cur_s1_len, 15), -1.0, dtype=torch.float16, device=device)
             best_indices_gpu = torch.full((cur_s1_len, 15), -1, dtype=torch.int64, device=device)
 
-            pbar = tqdm(total=n_ops, desc=f"Ops Pass ({country})", leave=False)
-            for ops_start in range(0, n_ops, ops_stream_batch):
-                ops_end = min(ops_start + ops_stream_batch, n_ops)
-                ops_chunk = torch.from_numpy(np.array(ops_mmap[ops_start:ops_end])).to(device=device, dtype=torch.float16)
+            pbar = tqdm(total=n_ops, desc=f"Ops Pass [{s1_start//S1_BLOCK_SIZE + 1}/{(n_s1 + S1_BLOCK_SIZE - 1)//S1_BLOCK_SIZE}]", leave=False)
+            for ops_start in range(0, n_ops, OPS_STREAM_BATCH):
+                ops_end = min(ops_start + OPS_STREAM_BATCH, n_ops)
+                ops_chunk = torch.from_numpy(ops_mmap[ops_start:ops_end]).to(device=device, dtype=torch.float16)
 
                 sims = torch.matmul(s1_tensor, ops_chunk.T)
 
@@ -268,15 +284,19 @@ def run_test_inference(target_countries=None):
             topk_indices_all[s1_start:s1_end] = best_indices_gpu.cpu().numpy()
 
             del s1_tensor, best_scores_gpu, best_indices_gpu
-            torch.cuda.empty_cache()
 
-        print(f"\n[GBDT Reranking] Multi-threaded vectorized evaluation for {country}...")
+        print(f"[✓] GPU Retrieval Completed in {time.time() - t_retrieval_start:.2f}s")
 
-        eval_batch_s1 = 25_000
-        n_workers = min(os.cpu_count() or 4, 8)
+        # =========================================================================
+        # 2. PROFILED GBDT RERANKING
+        # =========================================================================
+        print(f"\n[GBDT Reranking] Scoring filtered candidate pairs with {N_WORKERS} workers...")
+        
+        total_feat_time = 0.0
+        total_lgb_time = 0.0
 
-        for i in tqdm(range(0, n_s1, eval_batch_s1), desc=f"GBDT Eval {country}"):
-            c_end = min(i + eval_batch_s1, n_s1)
+        for i in tqdm(range(0, n_s1, EVAL_BATCH_S1), desc=f"GBDT Eval {country}"):
+            c_end = min(i + EVAL_BATCH_S1, n_s1)
             c_len = c_end - i
 
             candidate_items = []
@@ -291,32 +311,41 @@ def run_test_inference(target_countries=None):
                 top2_sc = row_vals[1] if len(row_vals) > 1 else 0.0
                 margin_delta = top1_sc - top2_sc
 
+                added = 0
                 for rank_pos, (score, c_idx) in enumerate(zip(row_vals, row_inds)):
                     if c_idx != -1 and score >= 0.62:
                         candidate_items.append((local_idx, rank_pos, int(c_idx), score, margin_delta))
-                        s1_cand_counts[local_idx] += 1
+                        added += 1
+                        if added >= 5:
+                            break
+                s1_cand_counts[local_idx] = added
 
             n_candidates = len(candidate_items)
             X_chunk = np.zeros((n_candidates, 22), dtype=np.float32)
 
             if n_candidates > 0:
+                t0 = time.time()
                 def worker_fill(range_tuple):
                     start_idx, end_idx = range_tuple
                     for c_i in range(start_idx, end_idx):
                         loc_i, r_pos, op_i, sc, m_delta = candidate_items[c_i]
                         g_idx = i + loc_i
-                        fill_feature_row(X_chunk, c_i, s1_meta[g_idx], ops_meta[op_i], sc, r_pos, m_delta)
+                        op_m = extract_meta(ops_names[op_i], ops_addrs[op_i])
+                        fill_feature_row(X_chunk, c_i, s1_meta[g_idx], op_m, sc, r_pos, m_delta)
 
-                chunk_step = (n_candidates + n_workers - 1) // n_workers
+                chunk_step = (n_candidates + N_WORKERS - 1) // N_WORKERS
                 ranges = [(k, min(k + chunk_step, n_candidates)) for k in range(0, n_candidates, chunk_step)]
 
-                with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                with ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
                     list(executor.map(worker_fill, ranges))
+                total_feat_time += (time.time() - t0)
 
+                t1 = time.time()
                 p_sum = np.zeros(n_candidates, dtype=np.float32)
                 for m in models:
                     p_sum += m.predict_proba(X_chunk)[:, 1]
                 probs = p_sum / len(models)
+                total_lgb_time += (time.time() - t1)
             else:
                 probs = np.array([], dtype=np.float32)
 
@@ -342,12 +371,15 @@ def run_test_inference(target_countries=None):
                                 matched_ops.append(ops_ids[op_i])
 
                 cands_55 = [ops_ids[int(c)] for score, c in zip(row_vals, row_inds) if c != -1 and score >= 0.55]
-                
                 f_cand.write(f"{sid}\t{','.join(cands_55)}\n")
                 f_match.write(f"{sid}\t{','.join(matched_ops)}\n")
 
             f_cand.flush()
             f_match.flush()
+
+        print(f"\n[Timing Breakdown - {country}]:")
+        print(f"  • Feature Extraction (RapidFuzz): {total_feat_time:.2f}s")
+        print(f"  • LightGBM Inference:             {total_lgb_time:.2f}s")
 
         del ops_mmap, s1_mmap, ops_ids, s1_ids, topk_scores_all, topk_indices_all
         gc.collect()
