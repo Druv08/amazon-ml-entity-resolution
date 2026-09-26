@@ -86,16 +86,21 @@ def _other_gap(score, cand, top):
     return np.nan_to_num(score - np.where(score >= t1, t2, t1), nan=0.0)
 
 
-def xtop(pairs, records, tfidf):
-    """predict.py pass 1: top2() of the cross-entity scores for one chunk, far cheaper than build_features.
-    Reduce all chunks with top2() and pass as build_features(xtop=...) so competing S1s in other chunks count."""
+def xscores(pairs, records, tfidf):
+    """The per-pair scores the cross-entity features compare across S1s (name_tfidf, block_score if present)."""
     name = records.set_index("entity_id")["business_name"].fillna("")
     cache = {v: _text(v) for v in set(name)}
     s = {"name_tfidf": _tfidf_cos([cache[v] for v in name.loc[pairs["s1_id"]]],
                                   [cache[v] for v in name.loc[pairs["cand_id"]]], tfidf["name"])}
     if "block_score" in pairs:
         s["block_score"] = pairs["block_score"].to_numpy()
-    return {c: top2(v, pairs["cand_id"]) for c, v in s.items()}
+    return s
+
+
+def xtop(pairs, records, tfidf):
+    """top2() of the cross-entity scores for one chunk, far cheaper than build_features. Reduce all chunks with
+    top2() (or stream.TopTwo) and pass as build_features(xtop=...) so competing S1s in other chunks count."""
+    return {c: top2(v, pairs["cand_id"]) for c, v in xscores(pairs, records, tfidf).items()}
 
 
 _NA = ["", "NULL", "null", "nan", "NaN", "None", "NA", "N/A", "n/a"]  # pandas' default NA strings found in the data
