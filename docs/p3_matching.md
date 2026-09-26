@@ -251,6 +251,59 @@ Blocking on the random development S1:
 The hybrid adds 1,112 true pairs beyond K=20 (random S1) and keeps all K=20 true pairs. If the hybrid is adopted,
 `candidate_pairs.tsv` must list the hybrid set.
 
+### Deep recovery: K=20 decisions plus confident deep matches (adopted rule: deep prob ≥ 0.85)
+
+`src/pipeline/deep_recovery.py` works in three steps:
+1. **Base:** the improved K=20 decisions (exclusivity plus threshold 0.70), which are never changed.
+2. **Deep candidates:** the hybrid rows that are not in the K=20 list, scored with the K=50 matcher's OOF probability.
+3. **Merge:** add deep candidates that pass the rule, with global exclusivity. The K=20 base keeps priority (a
+   candidate it gave to another S1 is never added), and deep claimants are ranked by highest probability, then the
+   smallest `s1_id`.
+
+Reproduce: `python -m src.pipeline.deep_recovery`.
+
+**The deep pool** has 875,040 rows with 1,591 true (0.18%); on the random S1 it is 594,540 rows with 1,112 true.
+Deep true pairs have a median probability of 0.86, while 99% of false ones are below 0.012.
+
+| Trait of deep candidates | True | False |
+|---|---|---|
+| median K=50 rank | 27 | 32 |
+| India | 60% | 43% |
+| candidate address missing | 25.5% | 10.2% |
+| strong house-number conflict | 1.4% | 42% |
+| name token-sort | 0.70 | 0.47 |
+| phonetic Jaccard | 0.63 | 0.29 |
+| S1 already has a K=20 match | 94.5% | 93.9% |
+
+66,652 false deep candidates (and no true ones) are candidates the K=20 base already gave to another S1, so
+base-priority exclusivity blocks them correctly.
+
+Results on the random development S1:
+
+| Method | macro-F0.5 | Δ vs 0.9494 (paired ±SE) | India | US | Singletons empty | Added TP | Added FP | S1 improved / harmed |
+|---|---|---|---|---|---|---|---|---|
+| K=20 base | 0.9494 | – | 0.9335 | 0.9601 | 0.929 | – | – | – |
+| deep prob ≥ 0.70 | 0.9524 | +0.0030 ± 0.0003 | 0.9388 | 0.9614 | 0.926 | 623 | 62 | 545 / 56 |
+| **deep prob ≥ 0.85 (adopted)** | **0.9525** | **+0.0031 ± 0.0003** | **0.9390** | **0.9615** | **0.927** | **572** | **39** | 503 / 34 |
+| deep prob ≥ 0.95 | 0.9518 | +0.0024 ± 0.0003 | 0.9379 | 0.9611 | 0.927 | 451 | 29 | 397 / 25 |
+| deep prob ≥ 0.99 | 0.9508 | +0.0014 ± 0.0002 | 0.9363 | 0.9605 | 0.927 | 290 | 26 | 263 / 22 |
+| rule B: ≥ 0.85, no strong number conflict | 0.9525 | +0.0031 ± 0.0003 | 0.9390 | 0.9615 | 0.927 | 567 | 31 | – |
+| rules C / D / E (name, margin, name+address requirements) | ≤ 0.9523 | ≤ +0.0029 | | | | | | |
+
+- **The gain is flat** (+0.0030 ± 0.0001) for any deep threshold from 0.66 to 0.86, so it does not hinge on the
+  exact threshold. It is about 11 paired SE, far above the ~0.001 noise.
+- **Rule B ties rule A** (+0.00307 vs +0.00306), and the other rules lose true pairs, so the plain threshold is
+  adopted.
+- **No deep classifier was built (checkpoint 10):** the simple threshold already works, and only about 39 deep FPs
+  are left to remove.
+- **Singletons drop slightly** (0.929 → 0.927), because 2 random-sample singletons receive a deep match. Matched S1
+  gain more than that.
+
+Production implications, if adopted:
+- Test inference needs both the K=20 run (base decisions) and a K=50 run for the deep probabilities.
+- `candidate_pairs.tsv` must list the HYBRID set (`src/pipeline/hybrid.py`), since every predicted match must be a
+  candidate.
+
 ### S1-level no-match gate (negative result, not adopted)
 
 The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
