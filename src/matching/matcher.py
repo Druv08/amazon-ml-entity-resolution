@@ -239,6 +239,11 @@ def train(X, y, sample_weight=None, **kw):
     return HistGradientBoostingClassifier(**{**params, **kw}).fit(X, y, sample_weight=sample_weight)
 
 
+# the production matcher (train.py): model M3 of docs/p3_matching.md "Model ensemble experiment", +0.0033 on the
+# Hybrid50 decision at unchanged cost. train()'s defaults stay the earlier 31-leaf model the older experiments used.
+PRODUCTION_PARAMS = dict(max_leaf_nodes=63)
+
+
 def best_threshold(pairs, prob, truth):
     grid = np.round(np.arange(0.05, 0.99, 0.01), 2)
     scores = [macro_f05(to_matches(pairs, prob, t, truth), truth) for t in grid]

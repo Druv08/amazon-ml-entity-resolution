@@ -18,8 +18,8 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
 
 from src.blocking.handoff import CandidateStore
-from src.matching.matcher import (best_threshold, build_features, exclusive, fit_tfidf, from_store, macro_f05,
-                                  to_matches, train, xtop)
+from src.matching.matcher import (PRODUCTION_PARAMS, best_threshold, build_features, exclusive, fit_tfidf, from_store,
+                                  macro_f05, to_matches, train, xtop)
 from src.matching.extra_features import PRODUCTION_GROUPS, load_name_stats
 from src.matching.sample_candidates import OUT
 
@@ -108,12 +108,13 @@ if __name__ == "__main__":
         Xv = X.drop(columns=X.filter(regex=v).columns) if v else X
         oof = np.zeros(len(pairs))
         for tr, va in GroupKFold(5).split(Xv, y, pairs["s1_id"]):
-            oof[va] = train(Xv.iloc[tr], y[tr]).predict_proba(Xv.iloc[va])[:, 1]
+            oof[va] = train(Xv.iloc[tr], y[tr], **PRODUCTION_PARAMS).predict_proba(Xv.iloc[va])[:, 1]
         print(f"variant drop={v!r} ({Xv.shape[1]} features) CV {time.time() - t0:.0f}s", flush=True)
         r = report(pairs, oof, truth, s1, hard)
         if i == 0:
             pairs[["s1_id", "cand_id", "rank", "label"]].assign(prob=oof).to_parquet(f"{a.cands}/oof.parquet")  # P4
             with open(f"{a.cands}/matcher.pkl", "wb") as fh:  # predict.py always applies exclusive()
-                pickle.dump({"model": train(Xv, y), "threshold": r["threshold"], "features": list(Xv.columns),
-                             "tfidf": tfidf, "top_k": top_k, "feature_groups": groups}, fh)
+                pickle.dump({"model": train(Xv, y, **PRODUCTION_PARAMS), "threshold": r["threshold"],
+                             "features": list(Xv.columns), "tfidf": tfidf, "top_k": top_k, "feature_groups": groups,
+                             "params": PRODUCTION_PARAMS}, fh)
             print(f"  saved {a.cands}/matcher.pkl + oof.parquet, {time.time() - t0:.0f}s", flush=True)

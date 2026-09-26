@@ -384,7 +384,16 @@ Findings:
 - **Inference cost is unchanged at K=20** (8.9 vs 9.4 s per 1M rows). At K=50 it goes from 4.5 to 9.5 s per 1M rows,
   because early stopping ends later. Either way it is small next to feature building (~170 CPU-s per 1M pairs).
 
-The production first-stage choice (M3) is decided together with checkpoint 15 below.
+**Adopted:** `train.py` now trains the production matchers with M3 (`matcher.PRODUCTION_PARAMS`). The retrained
+K=20 OOF is bit-identical to the experiment's M3 OOF, the threshold stays 0.70 and the deep rule stays ≥ 0.85.
+`matcher.train()` keeps the 31-leaf defaults that the earlier experiments used. The M0 artifacts are kept as
+`matcher_m0.pkl` / `oof_m0.parquet` (git-ignored). The strictly nested check below confirms the gain (+0.0032).
+
+**K=50 alone becomes competitive with M3.** Retrained with M3, K=50 alone reaches 0.9561 (threshold 0.77,
+singletons 0.952), statistically tied with Hybrid50 on M3 at 0.9558 (+0.0003 ± 0.0005, CI [−0.0006, +0.0013]).
+With M0, K=50 alone was clearly below K=20. The extra capacity lets the model use the deeper lists. A single K=50
+run is therefore a simpler, cheaper equal-score alternative to the two-run hybrid: one blocking run and one stream.
+Hybrid50 stays the production path, because it is verified and the meta-model gain below was measured on it.
 
 ### Structured decisions on top of the pair probabilities (checkpoint 15)
 
@@ -456,6 +465,37 @@ with winners by meta score.
 The pair-feature meta-model has a subtle stacking caveat. The first-stage OOF probabilities of its training rows came
 from models that had seen the held-out fold's labels; this is standard stacking, but not strictly clean. The
 strictly nested re-run is below.
+
+**Strictly nested re-run** (`python -m src.evaluation.structured_decoder strict_meta --first M3`, 23 min). For every
+outer fold k:
+- the first-stage K=20 and K=50 matchers are retrained without fold k: inner 4-fold OOF for the training S1, and a
+  model on all four training folds for fold k;
+- the baseline threshold t20, the meta thresholds and the meta-model are all fitted on the training folds.
+
+No model or threshold that touches fold k has seen a fold-k label. The baseline in the same framework is the first
+stage alone, with t20 per fold and deep 0.85.
+
+| System (first stage M3, strict) | macro-F0.5 | Δ vs 0.9525 (±SE) [95% CI] | India | US | Singletons | FP | FN | Rank 1–3 FP |
+|---|---|---|---|---|---|---|---|---|
+| first stage only (Hybrid50 decision) | 0.9557 | +0.0032 ± 0.0005 [+0.0023, +0.0041] | 0.9427 | 0.9644 | 0.938 | 867 | 6,199 | 404 |
+| **first stage + meta-model decoder** | **0.9574** | **+0.0049 ± 0.0006 [+0.0038, +0.0059]** | **0.9446** | **0.9659** | **0.956** | 884 | 5,783 | 377 |
+
+- **Meta over the M3 first stage:** +0.0017 ± 0.0004 [+0.0008, +0.0025], with India +0.0019 and US +0.0015. It is
+  positive in every outer fold (+0.0005, +0.0020, +0.0016, +0.0022, +0.0020); 689 S1 improve and 361 are harmed.
+- **The per-fold thresholds are stable:** t20 0.67–0.74; meta thresholds 0.67–0.75 for base and 0.65–0.77 for deep.
+- **The M3 gain survives strict evaluation:** +0.0032 strict vs +0.0033 non-strict.
+- **The same strict check with the M0 first stage** (`--first M0`, 19 min):
+  - M0 alone: 0.9527 (+0.0002 vs the adopted 0.9525, CI [−0.0001, +0.0006]), so the adopted estimate is unbiased.
+  - M0 + meta: 0.9545 (+0.0020 [+0.0010, +0.0030]); over its own first stage +0.0018 ± 0.0005 [+0.0007, +0.0028],
+    with India +0.0023 and US +0.0014.
+  - Positive in 4 of 5 folds.
+  - The meta gain therefore replicates on both first stages.
+
+**Decision:**
+- **The meta-model decoder on the M3 first stage is the best development system (0.9574).** It clears the ≥ 0.9540
+  bar and gains ≥ +0.0015 over its own first stage, with a CI above zero and both countries improving.
+- **It is not in production yet.** It needs a joint pass over the paired K=20/K=50 shards: first-stage
+  probabilities of all the S1's rows for the context features, then the meta score, then exclusivity.
 
 ### Targeted blocker rescue (checkpoint 16): negative
 
@@ -649,15 +689,30 @@ The two runs share one copy of the source tables (`CandidateStore(..., tables=..
 statistics. Paired shards are processed one per country at a time, so memory stays bounded as in single-K
 inference.
 
+The first-stage matchers are whatever `train.py` saved. Since checkpoint 14 that is the 63-leaf M3 configuration;
+the equivalence and benchmark numbers below cover both the earlier M0 models and M3.
+
 **Equivalence.** `src/pipeline/hybrid_equivalence.py` re-derives both files on real test smoke runs through an
 independent path:
 - every pair scored in memory, with the global cross-entity top-2 over the whole run;
 - then the offline functions `hybrid_candidates`, `base_predictions` and `merge_deep`.
 
-| Smoke set (first N test S1) | Pairs K=20 / K=50 | Base matches | Deep matches | `matching_results.tsv` | `candidate_pairs.tsv` | Production runtime |
-|---|---|---|---|---|---|---|
-| 5k | 100k / 250k | 16,073 | 219 | identical | identical | 152 s |
-| 50k | 1.0M / 2.5M | 160,471 | 2,324 | identical | identical | 479 s (a training job shared the CPU) |
+| Smoke set (first N test S1) | Matchers | Pairs K=20 / K=50 | Base matches | Deep matches | `matching_results.tsv` | `candidate_pairs.tsv` | Production runtime (2 workers) |
+|---|---|---|---|---|---|---|---|
+| 5k | M0 | 100k / 250k | 16,073 | 219 | identical | identical | 152 s |
+| 50k | M0 | 1.0M / 2.5M | 160,471 | 2,324 | identical | identical | 479 s |
+| 5k | M3 (production) | 100k / 250k | 16,120 | 274 | identical | identical | 153 s |
+| 50k | M3 (production) | 1.0M / 2.5M | 160,843 | 2,671 | (benchmark run) | | **478 s, peak RAM 6.55 GB** (process tree) |
+
+**Runtime breakdown (50k):**
+- about 95 s fixed: source tables and group E name statistics;
+- about 115 s for the K=20 stage (1.0M pairs);
+- about 260 s for the K=50 stage: 2.5M pairs through pass 1 and features, 1.5M deep rows scored;
+- about 10 s for outputs.
+
+**Full-test estimate** (extrapolated from these numbers, not measured): about 3.7 h with 2 workers. RAM should stay
+near 7 GB, because the smoke runs already hold the full test source tables and per-candidate arrays; only the
+number of shards grows.
 
 **Checks on the smoke outputs:**
 - Official validator (`--check-ids`, against a copy of `test_source1.tsv` cut to the smoke S1): **PASS**, with no
@@ -689,6 +744,11 @@ python -m src.blocking.generate_candidates --split test --top-k 50 --out-dir out
 python -m src.pipeline.predict_hybrid   # -> output/matching_results.tsv + output/candidate_pairs.tsv (+ hybrid_summary.json)
 python -m src.pipeline.hybrid_equivalence --base-cands output/p3_smoke/k20_5000 --deep-cands output/p3_smoke/k50_5000   # smoke check
 python resources/utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir data/raw/test
+# development experiments (checkpoints 14-17; development sample only, never the final holdout)
+python -m src.matching.ensemble_experiment oof && python -m src.matching.ensemble_experiment eval
+python -m src.evaluation.structured_decoder analyze   # also: adaptive | meta | count | competition
+python -m src.evaluation.structured_decoder strict_meta --first M3
+python -m src.evaluation.blocker_rescue analyze && python -m src.evaluation.blocker_rescue recall --channel address   # or trigram; then: score
 ```
 
 Previous results with the stand-in token blocker (K=30, macro-F0.5 0.8877) are in git history (`docs/p3_matching.md` at e5f18fb).
