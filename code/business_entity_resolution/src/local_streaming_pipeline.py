@@ -23,7 +23,6 @@ CACHE_DIR = "temp_cache"
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-INDIC_REGEX = re.compile(r'[\u0900-\u0D7F]')
 CORP_STOPWORDS = {
     'private', 'limited', 'ltd', 'pvt', 'inc', 'llc', 'corp', 'corporation',
     'services', 'solutions', 'enterprises', 'company', 'co', 'holdings', 'group',
@@ -36,6 +35,8 @@ US_STATES = {
     'ne', 'nv', 'nh', 'nj', 'nm', 'ny', 'nc', 'nd', 'oh', 'ok', 'or', 'pa', 'ri',
     'sc', 'sd', 'tn', 'tx', 'ut', 'vt', 'va', 'wa', 'wv', 'wi', 'wy'
 }
+
+INDIC_REGEX = re.compile(r'[\u0900-\u0D7F]')
 
 def transliterate_indic(text: str) -> str:
     if not text or not HAS_INDIC:
@@ -57,7 +58,7 @@ def extract_meta(name: str, addr: str):
     raw_name = "".join(n_core) if n_core else "".join(n_tokens)
 
     meta_keys = set()
-    for t in (n_core if n_core else n_tokens)[:4]:
+    for t in (n_core if n_core else n_tokens)[:3]:
         dm = doublemetaphone(t)
         if dm[0]: meta_keys.add(dm[0])
         if dm[1]: meta_keys.add(dm[1])
@@ -71,7 +72,7 @@ def extract_meta(name: str, addr: str):
 
     return (core_name, raw_name, meta_keys), (core_addr, nums, states)
 
-def compute_features_22(s1_meta, op_meta, dense_sc, rank_pos, margin_delta):
+def compute_features_fast(s1_meta, op_meta, dense_sc, rank_pos, margin_delta):
     (s1_cn, s1_rn, s1_meta_keys), (s1_ca, s1_nums, s1_st) = s1_meta
     (op_cn, op_rn, op_meta_keys), (op_ca, op_nums, op_st) = op_meta
 
@@ -117,13 +118,20 @@ def compute_features_22(s1_meta, op_meta, dense_sc, rank_pos, margin_delta):
     ]
 
 @torch.no_grad()
-def encode_to_disk(texts, model, tokenizer, device, file_path, batch_size=256):
+def encode_to_disk(texts, model, tokenizer, device, file_path, batch_size=512):
     n_samples = len(texts)
     dim = 1024
+    expected_bytes = n_samples * dim * 2
+
+    if os.path.exists(file_path) and os.path.getsize(file_path) == expected_bytes:
+        print(f"  [Found existing cache] Reusing: {file_path} ({n_samples} vectors)")
+        return np.memmap(file_path, dtype='float16', mode='r', shape=(n_samples, dim))
+
+    print(f"  [Generating cache] Encoding {n_samples} items to {file_path}...")
     mmap = np.memmap(file_path, dtype='float16', mode='w+', shape=(n_samples, dim))
     for i in tqdm(range(0, n_samples, batch_size), desc="Encoding", leave=False):
         b = texts[i:i+batch_size]
-        inp = tokenizer(b, padding=True, truncation=True, max_length=128, return_tensors="pt").to(device)
+        inp = tokenizer(b, padding=True, truncation=True, max_length=96, return_tensors="pt").to(device)
         out = model(**inp)
         cls_norm = torch.nn.functional.normalize(out.last_hidden_state[:, 0, :], p=2, dim=1).half()
         mmap[i:i+len(b)] = cls_norm.cpu().numpy()
@@ -132,12 +140,12 @@ def encode_to_disk(texts, model, tokenizer, device, file_path, batch_size=256):
 
 def run_test_inference(target_countries=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
+    print(f"Device: {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
 
-    print("[Loading 5-Fold Ensembles]")
+    print("[Loading Models]")
     models = [joblib.load(f"lgb_fold_{f}.pkl") for f in range(5)]
 
-    print("[Loading Test Dataset]")
+    print("[Loading Datasets]")
     s1_df = pl.read_csv(os.path.join(DATA_DIR, "test_source1.tsv"), separator="\t")
     s2_df = pl.read_csv(os.path.join(DATA_DIR, "test_source2.tsv"), separator="\t")
     s3_df = pl.read_csv(os.path.join(DATA_DIR, "test_source3.tsv"), separator="\t")
@@ -171,7 +179,6 @@ def run_test_inference(target_countries=None):
             texts.append(f"[COL] name [VAL] {m[0][0]} [COL] address [VAL] {str(a or '').lower()}")
         return texts, meta
 
-    K = 25
     ANCHOR_THRESH = 0.84
     SISTER_THRESH = 0.76
 
@@ -198,33 +205,30 @@ def run_test_inference(target_countries=None):
         s1_mmap_path = os.path.join(CACHE_DIR, f"s1_{country}.dat")
         ops_mmap_path = os.path.join(CACHE_DIR, f"ops_{country}.dat")
 
-        ops_mmap = encode_to_disk(ops_texts, mod, tok, device, ops_mmap_path, batch_size=256)
+        ops_mmap = encode_to_disk(ops_texts, mod, tok, device, ops_mmap_path, batch_size=512)
         del ops_texts
         gc.collect()
 
-        s1_mmap = encode_to_disk(s1_texts, mod, tok, device, s1_mmap_path, batch_size=256)
+        s1_mmap = encode_to_disk(s1_texts, mod, tok, device, s1_mmap_path, batch_size=512)
         del s1_texts
         gc.collect()
 
-        s1_candidates_map = {}
-        best_ops_assignment = {}
-        s1_has_anchor = set()
-
-        s1_chunk_size = 1000
-        ops_block_size = 500000
+        # Small chunk streaming to prevent RAM overflow
+        s1_chunk_size = 500
+        ops_block_size = 300000
 
         for i in tqdm(range(0, n_s1, s1_chunk_size), desc=f"Scoring {country}"):
             s1_chunk = torch.from_numpy(s1_mmap[i:i+s1_chunk_size]).to(device)
             c_len = s1_chunk.shape[0]
 
-            best_scores = np.full((c_len, K), -1.0, dtype=np.float32)
-            best_indices = np.full((c_len, K), -1, dtype=np.int64)
+            best_scores = np.full((c_len, 15), -1.0, dtype=np.float32)
+            best_indices = np.full((c_len, 15), -1, dtype=np.int64)
 
             for b_start in range(0, n_ops, ops_block_size):
                 b_end = min(b_start + ops_block_size, n_ops)
                 ops_block = torch.from_numpy(ops_mmap[b_start:b_end]).to(device)
                 sims = torch.matmul(s1_chunk, ops_block.T)
-                block_vals, block_inds = torch.topk(sims, k=min(K, ops_block.shape[0]), dim=1)
+                block_vals, block_inds = torch.topk(sims, k=min(15, ops_block.shape[0]), dim=1)
 
                 b_vals_np = block_vals.cpu().numpy()
                 b_inds_np = (block_inds + b_start).cpu().numpy()
@@ -232,7 +236,7 @@ def run_test_inference(target_countries=None):
                 for r in range(c_len):
                     comb_scores = np.concatenate([best_scores[r], b_vals_np[r]])
                     comb_indices = np.concatenate([best_indices[r], b_inds_np[r]])
-                    top_idx = np.argsort(comb_scores)[::-1][:K]
+                    top_idx = np.argsort(comb_scores)[::-1][:15]
                     best_scores[r] = comb_scores[top_idx]
                     best_indices[r] = comb_indices[top_idx]
 
@@ -240,7 +244,7 @@ def run_test_inference(target_countries=None):
                 torch.cuda.empty_cache()
 
             chunk_pairs = []
-            chunk_coords = []
+            pair_meta = []  # (local_idx, op_id)
 
             for local_idx in range(c_len):
                 global_idx = i + local_idx
@@ -252,59 +256,62 @@ def run_test_inference(target_countries=None):
                 top2_sc = row_vals[1] if len(row_vals) > 1 else 0.0
                 margin_delta = top1_sc - top2_sc
 
-                cands = []
                 for rank_pos, (score, c_idx) in enumerate(zip(row_vals, row_inds)):
-                    if c_idx != -1 and score >= 0.52:
+                    if c_idx != -1 and score >= 0.62:
                         c_idx_int = int(c_idx)
-                        cands.append(ops_ids[c_idx_int])
-                        feats = compute_features_22(s1_meta[global_idx], ops_meta[c_idx_int], score, rank_pos, margin_delta)
+                        feats = compute_features_fast(s1_meta[global_idx], ops_meta[c_idx_int], score, rank_pos, margin_delta)
                         chunk_pairs.append(feats)
-                        chunk_coords.append((sid, c_idx_int))
-                s1_candidates_map[sid] = cands
+                        pair_meta.append((local_idx, ops_ids[c_idx_int]))
 
+            # Immediate batch prediction and output flush
+            chunk_matches = {local_idx: [] for local_idx in range(c_len)}
             if chunk_pairs:
                 X_chunk = np.array(chunk_pairs)
-                probs = np.mean([m.predict_proba(X_chunk)[:, 1] for m in models], axis=0)
+                p_sum = np.zeros(len(X_chunk), dtype=np.float32)
+                for m in models:
+                    p_sum += m.predict_proba(X_chunk)[:, 1]
+                probs = p_sum / len(models)
 
-                for (sid, c_idx_int), prob in zip(chunk_coords, probs):
+                # Local cluster assignment
+                has_anchor_local = set()
+                for (local_idx, op_id), prob in zip(pair_meta, probs):
                     if prob >= ANCHOR_THRESH:
-                        s1_has_anchor.add(sid)
-                        if c_idx_int not in best_ops_assignment or prob > best_ops_assignment[c_idx_int][1]:
-                            best_ops_assignment[c_idx_int] = (sid, float(prob))
-                    elif sid in s1_has_anchor and prob >= SISTER_THRESH:
-                        if c_idx_int not in best_ops_assignment or prob > best_ops_assignment[c_idx_int][1]:
-                            best_ops_assignment[c_idx_int] = (sid, float(prob))
+                        has_anchor_local.add(local_idx)
+                        chunk_matches[local_idx].append((op_id, prob))
+                    elif local_idx in has_anchor_local and prob >= SISTER_THRESH:
+                        chunk_matches[local_idx].append((op_id, prob))
 
-            del s1_chunk
+            # Stream straight to file
+            for local_idx in range(c_len):
+                global_idx = i + local_idx
+                sid = s1_ids[global_idx]
+                row_inds = best_indices[local_idx]
+                row_vals = best_scores[local_idx]
+                
+                cands = [ops_ids[int(c)] for score, c in zip(row_vals, row_inds) if c != -1 and score >= 0.55]
+                matches = [m[0] for m in chunk_matches[local_idx] if m[0] in cands]
+
+                f_cand.write(f"{sid}\t{','.join(cands)}\n")
+                f_match.write(f"{sid}\t{','.join(matches)}\n")
+
+            f_cand.flush()
+            f_match.flush()
+
+            del s1_chunk, chunk_pairs, pair_meta, chunk_matches
             torch.cuda.empty_cache()
+            gc.collect()
 
-        final_matches_map = {sid: [] for sid in s1_ids}
-        for c_idx_int, (assigned_s1, _) in best_ops_assignment.items():
-            final_matches_map[assigned_s1].append(ops_ids[c_idx_int])
-
-        print(f"Writing {country} output to disk...")
-        for sid in s1_ids:
-            cands = s1_candidates_map.get(sid, [])
-            matches = [m for m in final_matches_map.get(sid, []) if m in cands]
-            f_cand.write(f"{sid}\t{','.join(cands)}\n")
-            f_match.write(f"{sid}\t{','.join(matches)}\n")
-
-        f_cand.flush()
-        f_match.flush()
-
-        del ops_mmap, s1_mmap, ops_ids, s1_ids, s1_candidates_map, best_ops_assignment, final_matches_map
+        del ops_mmap, s1_mmap, ops_ids, s1_ids
         gc.collect()
-        if os.path.exists(s1_mmap_path): os.remove(s1_mmap_path)
-        if os.path.exists(ops_mmap_path): os.remove(ops_mmap_path)
 
     f_cand.close()
     f_match.close()
-    print(f"\nExecution finished! Saved to {match_path} and {cand_path}")
+    print(f"\nDone! Output written to {match_path} and {cand_path}")
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Distributed or Local Production Pipeline")
-    parser.add_argument("--countries", nargs="+", default=None, help="Target country partitions")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--countries", nargs="+", default=None)
     args = parser.parse_args()
 
     run_test_inference(target_countries=args.countries)
