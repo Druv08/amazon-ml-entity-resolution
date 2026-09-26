@@ -457,6 +457,58 @@ The pair-feature meta-model has a subtle stacking caveat. The first-stage OOF pr
 from models that had seen the held-out fold's labels; this is standard stacking, but not strictly clean. The
 strictly nested re-run is below.
 
+### Targeted blocker rescue (checkpoint 16): negative
+
+`src/evaluation/blocker_rescue.py`. The true pairs that never reach the matcher (**Hybrid50 FN1**) number 2,382 on the
+random S1, 3.5% of true pairs. Their traits, compared with true pairs the blocker does find:
+
+| FN1 trait | FN1 share | Reachable share |
+|---|---|---|
+| India | 64.6% | 39.6% |
+| missing address (either side) | 31.4% | 3.4% |
+| no shared name token | 40.4% | 13.4% |
+| address-only evidence (no name token, address token-sort ≥ 0.6) | 17.3% | 12.3% |
+| native-script candidate | 17.7% | 6.9% |
+| house-number conflict | 11.2% | 4.9% |
+| transliteration variant (Latin, phonetic match) | 7.9% | 4.3% |
+| alias / rebrand (different name, same address) | 5.0% | 3.9% |
+| short S1 name (≤ 1 token) | 1.0% | 0.6% |
+| S1 with weak evidence (K=20 top prob < 0.5) | 6.9% | 0.2% |
+
+Most FN1 are extra matches of S1 that already have a confident match, so targeting weak S1 cannot reach them.
+
+**Two rescue channels** reuse P2's encoded token fields and the engine's vocabulary rules, at no more than +5/+10
+candidates per S1:
+- **trigram:** the `g` field, i.e. trigrams of the transliterated, space-free name, with df ≤ 2000, as the old
+  fallback used;
+- **address:** the `a`/`ab` fields with df ≤ 20000 and P2's weights 1.5/1.0.
+
+| System (random S1) | Pair recall | Ceiling | Added / S1 (mean, p95, max) | Extra true / false | macro-F0.5 (rescue classifier, pre-declared T=0.85) |
+|---|---|---|---|---|---|
+| Hybrid50 | 0.9654 | 0.9874 | – | – | 0.9525 |
+| + trigram, +5 | 0.9659 | 0.9875 | 1.5 / 5 / 5 | 31 / 30,400 | – |
+| + trigram, +10 | 0.9660 | 0.9876 | 3.1 / 10 / 10 | 42 / 60,792 | 0.9521 (−0.0004 ± 0.0001; +17 TP / +44 FP) |
+| + address, +5 | 0.9671 | 0.9878 | 5.0 / 5 / 5 | 113 / 98,844 | – |
+| + address, +10 | 0.9674 | 0.9879 | 10.0 / 10 / 10 | 138 / 197,769 | 0.9512 (−0.0013 ± 0.0002; +84 TP / +145 FP) |
+
+The targeted variants recover almost nothing:
+- **weak-evidence S1 only:** 2 (trigram) or 3 (address) true pairs;
+- **missing-address or non-Latin candidates only:** 11 (trigram) or 5 (address) true pairs.
+
+Recovery by group: trigram +10 finds India 25 / US 17 / native-script 0; address +10 finds India 33 / US 105 /
+native-script 5.
+
+How the rescue classifier works:
+- It is a cross-fitted HGB on the rescue pairs, using the matcher's A+C+E features.
+- The channel score stands in for the block/name score, and the rescue rank for P2's rank.
+- Rescued pairs get the lowest priority: base > deep > rescue.
+
+Retrieval took 80 s (trigram) and 233 s (address) for 29k S1.
+
+**Decision: not adopted.** Even perfect decisions on the rescued pairs would add at most +0.0005 (ceiling), and
+the actual effect is negative. The missed pairs mostly have *no* usable name or address evidence (missing
+addresses, no shared tokens), so no local token channel can reach them cheaply.
+
 ### Competition / ownership (checkpoint 17)
 
 `python -m src.evaluation.structured_decoder competition` uses test-available signals only: the number of claiming
