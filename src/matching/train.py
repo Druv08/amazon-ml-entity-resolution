@@ -100,9 +100,13 @@ if __name__ == "__main__":
 
     pairs, records, truth, s1, claimed, top_k = load(a.cands)
     groups = tuple(a.groups)
+    t_feat = time.time()
     X, y, tfidf, hard = featurize(pairs, records, claimed, groups)
     del claimed
     print(f"features {time.time() - t0:.0f}s: {X.shape}, positive rate {y.mean():.3f}", flush=True)
+    from src.matching.feature_cache import write_cache
+
+    write_cache(a.cands, groups, pairs, X, round(time.time() - t_feat, 1))  # reused by experiments / train_meta
 
     for i, v in enumerate(a.variants):
         Xv = X.drop(columns=X.filter(regex=v).columns) if v else X

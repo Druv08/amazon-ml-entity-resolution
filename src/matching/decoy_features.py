@@ -4,8 +4,8 @@ The oracle-gap audit's uncertain band is dominated by two kinds of near-identica
 "Oracle gap"):
   true duplicates  typos and transpositions, OCR confusions (0/o, 1/l, c/e), added generic words (LLC, Services,
                    Center, Shri), token shuffles
-  decoys           one distinctive name token replaced or morphed at its end (Montova -> Montovi, Nexial ->
-                   Nexialyn), an injected house-number prefix ("H.no 42 ..."), a truncated / extended number
+  decoys           one distinctive name token replaced or morphed at its end (e.g. Tavell -> Tavelli, Quorin ->
+                   Quorinex), an injected house-number prefix ("H.no 12 ..."), a truncated / extended number
 Overall string similarity scores both alike. These features align the distinctive (non-generic) tokens and record
 the TYPE of difference. They use the two records only, so they are computed identically on test.
 """
@@ -64,7 +64,7 @@ def _generic(tok):
 
 def _joined(tok, all_other, own):
     """tok appears inside a joined token of the other name whose remainder holds another token of its own name
-    ("montonhospital" = "monton" + "hospital"), unlike a morph ("nexialyn" = "nexial" + "yn")."""
+    ("tavellbakery" = "tavell" + "bakery"), unlike a morph ("quorinex" = "quorin" + "ex")."""
     for x in all_other:
         if len(x) > len(tok) and tok in x:
             rest = x.replace(tok, "", 1)
@@ -75,7 +75,7 @@ def _joined(tok, all_other, own):
 
 def _kind(tok, others, all_other, own):
     """Best relation of a token to the other name's distinctive tokens (all_other: all its tokens, own: all tokens
-    of tok's own name, for joined forms like "#montonhospital" or "montonhospital.com")."""
+    of tok's own name, for joined forms like "#tavellbakery" or "tavellbakery.com")."""
     if tok in others:
         return "exact"
     o = tok.translate(_OCR)

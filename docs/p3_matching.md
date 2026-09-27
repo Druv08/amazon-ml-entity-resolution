@@ -628,6 +628,123 @@ bottleneck is therefore **discrimination inside the uncertain band**. Inspecting
 against corrupted true duplicates (see "Token-alignment features" below). Similarity to the S1's confident matches
 does not separate them either (AUC 0.48–0.60).
 
+### Token-alignment ("decoy") features: the targeted fix
+
+The uncertain band holds two kinds of near-identical records, and overall string similarity scores them alike:
+- **Decoys** (invented illustrations): one distinctive name token replaced ("Harlow" → "Brenwick") or morphed at
+  its end ("Tavell" → "Tavelli", "Quorin" → "Quorinex"); an injected house-number prefix ("H.no 12 …"); a truncated or
+  extended number.
+- **True duplicates:** typos and transpositions, OCR confusions (0/o, 1/l, c/e), added generic words (LLC,
+  Services, Center, Shri), token shuffles, joined or domain forms ("#tavellbakery", "tavellbakery.com").
+
+`src/matching/decoy_features.py` (13 features, computed from the two records only, so identical on test) aligns
+each distinctive name token and records the type of difference:
+- exact, OCR-equivalent, joined form, interior one-edit typo, end morph, or none;
+- extra unmatched distinctive tokens in the candidate, and a "replaced token" flag;
+- added generic words;
+- an injected "H.no" prefix;
+- number extension or truncation, and number equality.
+
+Features for all 1.46M development pairs are built once in 131 s and cached (`decoy_experiment.all_row_decoy_features`).
+
+Controlled comparison (`src/evaluation/decoy_experiment.py`, cross-fitted, the same folds and nested thresholds as
+`train_meta`). Δ is against M3 Hybrid50 without the meta-model (0.9558):
+
+| Method | macro-F0.5 | Δ | India | US | Singletons | FP | TP |
+|---|---|---|---|---|---|---|---|
+| M3 + meta (production features) | 0.9574 | +0.0016 | 0.9450 | 0.9657 | 0.959 | 882 | 62,999 |
+| **M3 + meta + decoy** | **0.9624** | **+0.0066** | **0.9500** | **0.9707** | **0.963** | 747 | 63,643 |
+| M3 + decoy in the first stage, no meta | 0.9626 | +0.0068 | 0.9495 | 0.9713 | 0.958 | 598 | 63,210 |
+| M3 + decoy in the first stage + meta + decoy | 0.9630 | +0.0072 | 0.9494 | 0.9722 | 0.969 | 721 | 63,649 |
+
+Findings:
+- **The decoy features add +0.0050 ± 0.0004** to the meta decoder (95% CI [+0.0041, +0.0058]), with India
+  +0.0050 and US +0.0050. 1,048 S1 improve and 334 are harmed.
+- **Adding them to the first stage as well changes little:** +0.0006 ± 0.0005, CI crossing 0.
+- **The M3 + meta + decoy bundle** (`train_meta --decoy`) reproduces 0.9624 exactly, with the matrix and decision
+  checks passing and thresholds base 0.73, deep 0.65.
+
+**Strictly nested confirmation** (`strict_meta --first M3 --decoy --first-decoy`, 31 min). The first stage, with
+the decoy features, is retrained inside every outer fold. Nothing that scores a fold has seen its labels.
+
+| System (strict) | macro-F0.5 | Δ vs 0.9574 | India | US | Singletons | FP | FN |
+|---|---|---|---|---|---|---|---|
+| M3 + decoy first stage (Hybrid50, t20 per fold) | 0.9627 | +0.0053 | 0.9498 | 0.9713 | 0.956 | 618 | 5,579 |
+| **M3 + decoy first stage + meta decoder** | **0.9643** | **+0.0069** | **0.9512** | **0.9731** | **0.977** | 671 | 5,113 |
+
+The meta decoder adds +0.0016 ± 0.0004 [+0.0008, +0.0024] over the first stage, positive in all 5 folds.
+
+**Adopted:**
+- The features are a first-stage `build_features` group "T" (`extra_features.PRODUCTION_GROUPS` = A, C, E, T), so
+  they also reach the meta-model through the first-stage features.
+- The production matchers were retrained through `train.py`, which now also writes the fingerprinted feature cache
+  it computes (`X_ACET.parquet`).
+- The retrained K=20 and K=50 OOF are **bit-identical** to the experiment's M3 + decoy OOF. The production feature
+  path therefore computes exactly the experimental features.
+
+**Retrained matchers:**
+- **K=20:** alone 0.9593 (was 0.9525), threshold 0.76.
+- **K=50:** alone 0.9626 (was 0.9561), threshold 0.74.
+
+**New `train_meta` bundle:**
+- `meta_extra` is empty, because the first-stage features already hold group T.
+- Thresholds base 0.74, deep 0.63; built in 61 s from caches.
+- Cross-fitted estimate **0.9630**; the first stage alone scores 0.9628.
+- The strictly nested estimate of this architecture is **0.9643**. Paired against the previous 0.9574 system on the
+  same S1 (both strict): **+0.0069 ± 0.0006, 95% CI [+0.0058, +0.0081]**, with India +0.0066 and US +0.0072;
+  1,377 S1 improve and 585 are harmed.
+
+**Oracle ladder after the fix** (`oracle_gap` on the new strict rows):
+- O0 0.9643, O1 0.9844, O2 0.9874, O3 0.9897.
+- Loss 0.0357 = cut 0.0201 (was 0.0257) + blocking 0.0126 + ranking 0.0029 (was 0.0043).
+- **Missing candidates (blocking) are now the single largest recoverable class:** +0.0140, ahead of "correctly
+  ranked but below the threshold" at +0.0117.
+
+### Stronger GBDT family: one controlled XGBoost test
+
+`python -m src.evaluation.gbdt_experiment` trains XGBoost 3.4 (already installed, no new dependency). It uses one
+predefined configuration: depth 8, 700 rounds, learning rate 0.05, subsample and colsample 0.8,
+`min_child_weight` 2, hist. Everything else matches M3 exactly: the cached matrices (61 + 13 token-alignment
+features), the GroupKFold of `train.py`, the Hybrid50 decision (t20 per fold, deep 0.85), and the cross-fitted
+meta + decoy decoder on top.
+
+| First stage (with the decoy features) | Hybrid50, first stage only | + meta + decoy | India | US | Singletons |
+|---|---|---|---|---|---|
+| HGB M3 | 0.9626 | 0.9630 | 0.9494 | 0.9722 | 0.969 |
+| **XGBoost** | **0.9640** | **0.9647** | **0.9526** | **0.9727** | **0.973** |
+
+Paired XGBoost − HGB:
+- **First stage only:** +0.0014 ± 0.0004, CI [+0.0007, +0.0021].
+- **With meta + decoy:** **+0.0016 ± 0.0004, CI [+0.0008, +0.0025]**, with India +0.0032 and US +0.0006.
+
+XGBoost 5-fold OOF takes 152 s at K=20 and 228 s at K=50, faster than M3. It clears the +0.0015 adoption bar only
+narrowly. Using it in production also needs the decoy features inside the first-stage feature set (a
+`build_features` group), a model-family switch in `train.py`, and a re-verified bundle. That is not done yet, and it
+is the recommended next step.
+
+### Candidate ceiling: targeted rescue cannot pass 0.990
+
+`python -m src.evaluation.candidate_ceiling` measures ceilings with no matcher involved. It uses four channels
+from P2's own encoded fields and vocabulary rules: name trigrams, rare address tokens, rare name tokens and
+phonetic keys. Each channel gives every development S1 up to 20 candidates that are not in its Hybrid50 list.
+
+| Rescue (random dev S1) | Pair recall | Ceiling | Added / S1 (mean, p95) | Extra true / false |
+|---|---|---|---|---|
+| none (Hybrid50) | 0.9654 | 0.9874 | – | – |
+| best single channel (address) +5 / +10 / +20 | 0.9671 / 0.9674 / 0.9678 | 0.9878 / 0.9879 / 0.9880 | 5 / 10 / 20 | 113 / 137 / 162 true |
+| all four channels +5 each | 0.9683 | 0.9883 | 15, 20 | 197 / 297,111 |
+| all four channels +10 each | 0.9691 | 0.9886 | 30, 40 | 256 / 589,825 |
+| all four channels +20 each | 0.9703 | **0.9889** | 59, 80 | 338 / 1,172,688 |
+| (reference) Hybrid50 + K=100, perfect selection | 0.9714 | 0.9897 | 100 | – |
+
+- **Coverage:** only 338 of the 2,382 missing true pairs are reached by any channel at depth 20.
+- **The unreached pairs:** 66% India, 20% native-script candidates, 32% missing address, and 39% share no name
+  token at all. They carry no local token evidence to retrieve them with.
+- **No targeted rescue reaches a 0.990 ceiling, let alone 0.993 or 0.995.** Even doubling the candidate lists gets
+  to 0.9889.
+- **What this means for 0.99:** a local macro-F0.5 of 0.99 is therefore impossible with this candidate architecture,
+  even with a perfect matcher.
+
 ### S1-level no-match gate (negative result, not adopted)
 
 The gate is a second classifier on S1-level signals, built only from the S1's own candidates: the top-1 and top-2
@@ -820,8 +937,24 @@ applying the meta decoder over the whole run at once (vectorised exclusivity).
 
 | Smoke set | Base / deep matches | Meta rows | `matching_results.tsv` | `candidate_pairs.tsv` | Validator | Production runtime (2 workers) |
 |---|---|---|---|---|---|---|
-| 5k | 16,162 / 358 | 25,063 | identical | identical | PASS | 200 s (CPU shared with a training job) |
-| 50k | 161,281 / 3,360 | 246,310 | offline reference re-run pending (the first attempt hit an O(n²) `np.isin` on string ids in the reference path, now fixed) | | | 448 s (CPU shared) |
+| 5k (0.9574 bundle) | 16,162 / 358 | 25,063 | identical | identical | PASS | 200 s (CPU shared with a training job) |
+| 50k (0.9574 bundle) | 161,281 / 3,360 | 246,310 | not re-derived (see note) | | | 448 s (CPU shared) |
+| **5k (final bundle, group T)** | 16,004 / 331 | 22,997 | identical | identical | PASS | 154 s |
+
+The first 50k offline reference hit a quadratic `np.isin` on string candidate ids inside `meta_decoder.decide`
+(NumPy loops in Python for object arrays). The ids are now factorized to integers, and `decide` handles 2.5M rows
+in 2 s. Production streaming never used that function; it uses the `Winners` state.
+
+**Adopted since: the token-alignment features** (see "Token-alignment features"). They went in two steps:
+1. **Meta-model only** (the bundle's `meta_extra`, computed by the workers for rows ≥ 0.02 from the shard records):
+   90 meta features, thresholds base 0.73 / deep 0.65, cross-fitted estimate 0.9624. On 5k smoke it was
+   byte-identical to the offline reference (16,096 base + 340 deep matches) with validator PASS.
+2. **Final: the first-stage feature group T** (both matchers retrained, bit-identical to the experiment), so the
+   meta-model sees the features through the first stage.
+   - Thresholds base 0.74 / deep 0.63; cross-fitted estimate **0.9630**; strictly nested **0.9643**.
+   - `train_meta` leaves `meta_extra` empty when the first stage has group T, and adds it otherwise.
+   - `--no-decoy` rebuilds the older bundles. The 0.9574 bundle is kept as `hybrid_meta_nodecoy.pkl`, and the M3
+     matchers without group T as `matcher_m3.pkl`.
 
 **Tests:** `tests/test_meta_decoder.py` covers:
 - context features against a loop reference, with ties;
@@ -851,7 +984,8 @@ python -m src.matching.predict --model output/candidates_p3/k20/matcher.pkl   # 
 # adopted Hybrid50 (needs output/candidates_p3/k50 trained with: sample_candidates --top-k 50 + train --cands .../k50):
 python -m src.blocking.generate_candidates --split test --top-k 20 --out-dir output/candidates_k20 --no-tsv
 python -m src.blocking.generate_candidates --split test --top-k 50 --out-dir output/candidates_k50 --no-tsv
-python -m src.pipeline.predict_hybrid   # -> output/matching_results.tsv + output/candidate_pairs.tsv (+ hybrid_summary.json)
+python -m src.pipeline.train_meta       # production bundle from cached development artifacts (~3 min)
+python -m src.pipeline.predict_hybrid   # meta decoder -> output/matching_results.tsv + output/candidate_pairs.tsv (+ hybrid_summary.json)
 python -m src.pipeline.hybrid_equivalence --base-cands output/p3_smoke/k20_5000 --deep-cands output/p3_smoke/k50_5000   # smoke check
 python resources/utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir data/raw/test
 # development experiments (checkpoints 14-17; development sample only, never the final holdout)
@@ -859,6 +993,10 @@ python -m src.matching.ensemble_experiment oof && python -m src.matching.ensembl
 python -m src.evaluation.structured_decoder analyze   # also: adaptive | meta | count | competition
 python -m src.evaluation.structured_decoder strict_meta --first M3
 python -m src.evaluation.blocker_rescue analyze && python -m src.evaluation.blocker_rescue recall --channel address   # or trigram; then: score
+python -m src.evaluation.structured_decoder strict_meta --first M3 --decoy   # strictly nested check (writes strict_rows_*.parquet)
+python -m src.evaluation.oracle_gap && python -m src.evaluation.set_decoder   # oracle ladder, error sources, expected-F0.5 cut
+python -m src.evaluation.decoy_experiment [--first-stage]   # token-alignment features, controlled comparison
+python -m src.evaluation.candidate_ceiling && python -m src.evaluation.gbdt_experiment
 ```
 
 Previous results with the stand-in token blocker (K=30, macro-F0.5 0.8877) are in git history (`docs/p3_matching.md` at e5f18fb).

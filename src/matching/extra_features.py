@@ -25,7 +25,8 @@ from src.blocking.normalize import has_nonlatin
 from .matcher import _STOP, _jaccard, _norm
 
 GROUPS = ("A", "C", "D", "E")
-PRODUCTION_GROUPS = ("A", "C", "E")  # adopted in docs/p3_matching.md "Targeted features"; D did not help
+# A, C, E: docs/p3_matching.md "Targeted features" (D did not help); T: "Token-alignment features"
+PRODUCTION_GROUPS = ("A", "C", "E", "T")
 
 
 def _texts(pairs, records, col):
@@ -186,6 +187,10 @@ def extra_features(groups, pairs, records, name_stats=None):
             if name_stats is None:
                 raise ValueError("group E needs NameStats of the split")
             parts.append(name_rarity_features(pairs, records, name_stats))
+        elif g == "T":
+            from .decoy_features import decoy_features
+
+            parts.append(decoy_features(pairs, records))
         else:
             raise ValueError(f"unknown feature group {g!r}")
     return pd.concat(parts, axis=1).astype(np.float32) if parts else pd.DataFrame(index=pairs.index)

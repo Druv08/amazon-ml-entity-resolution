@@ -39,8 +39,17 @@ def fingerprint(cands, groups=GROUPS, data_dir="data/raw/train"):
             "sources": {f: _file_identity(os.path.join(data_dir, f)) for f in DATA_FILES}}
 
 
-def _paths(cands):
-    return os.path.join(cands, "X_ACE.parquet"), os.path.join(cands, "X_ACE.fingerprint.json")
+def _paths(cands, groups=GROUPS):
+    g = "".join(groups)
+    return os.path.join(cands, f"X_{g}.parquet"), os.path.join(cands, f"X_{g}.fingerprint.json")
+
+
+def write_cache(cands, groups, pairs, X, seconds=None):
+    """Store a feature matrix built elsewhere (train.py) with its fingerprint, for later experiments / train_meta."""
+    path, fp_path = _paths(cands, groups)
+    X.assign(**{"__" + c: pairs[c].to_numpy() for c in ("s1_id", "cand_id", "rank", "label")}).to_parquet(path)
+    with open(fp_path, "w", encoding="utf-8") as fh:
+        json.dump({**fingerprint(cands, groups), "build": {"seconds": seconds, "by": "train.py"}}, fh, indent=2)
 
 
 def _split(frame):
@@ -63,7 +72,7 @@ def _legacy_ok(cands, frame):
 
 def feature_cache(cands, groups=GROUPS, rebuild=False, log=print):
     """(meta frame s1_id/cand_id/rank/label, X float32) of a development run, built once with train.featurize."""
-    path, fp_path = _paths(cands)
+    path, fp_path = _paths(cands, groups)
     want = fingerprint(cands, groups)
     if os.path.exists(path) and not rebuild:
         if os.path.exists(fp_path):

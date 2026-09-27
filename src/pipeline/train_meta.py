@@ -1,6 +1,7 @@
 """Train the production meta-decoder bundle from cached development artifacts (no blocking, no featurization).
 
     python -m src.pipeline.train_meta        # -> output/candidates_p3/hybrid_meta.pkl (+ hybrid_meta.json)
+    python -m src.pipeline.train_meta --no-decoy --out ...   # no meta-level token-alignment features (see --help)
 
 Inputs (git-ignored): the K=20 / K=50 production matchers (M3) with their out-of-fold probabilities
 (src/matching/train.py), the fingerprinted feature caches (src/matching/feature_cache.py) and the development sample.
@@ -43,8 +44,8 @@ def sha256(path):
 def dev_meta_rows(T, m20, m50, extra=(), ctx=None):
     """(rows >= floor, meta matrix) of the development Hybrid50 rows, from the fingerprinted feature caches.
     extra=("decoy",) appends the token-alignment features (src/matching/decoy_features.py, cached for all rows)."""
-    _, X20 = feature_cache(K20)
-    _, X50 = feature_cache(K50)
+    _, X20 = feature_cache(K20, tuple(m20.get("feature_groups", ())))
+    _, X50 = feature_cache(K50, tuple(m50.get("feature_groups", ())))
     if list(X20.columns) != list(m20["features"]) or list(X50.columns) != list(m50["features"]):
         raise ValueError("feature cache columns differ from the matchers' features")
     if list(m20["features"]) != list(m50["features"]):
@@ -70,9 +71,11 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="output/candidates_p3/hybrid_meta.pkl")
     ap.add_argument("--cap", type=int, default=50)
-    ap.add_argument("--decoy", action="store_true", help="add the token-alignment features to the meta-model")
+    ap.add_argument("--no-decoy", action="store_true",
+                    help="no meta-level token-alignment features (only matters for first stages without group T; "
+                         "with the M3 matchers lacking group T it rebuilds the earlier 0.9574 bundle)")
     a = ap.parse_args(argv)
-    extra = ("decoy",) if a.decoy else ()
+    extra = () if a.no_decoy else ("decoy",)  # adopted: docs/p3_matching.md "Token-alignment features"
     t0 = time.time()
     models = {}
     for role, d in (("base", K20), ("deep", K50)):
@@ -80,6 +83,8 @@ def main(argv=None):
             models[role] = pickle.load(fh)
         if models[role].get("params") != PRODUCTION_PARAMS:
             raise SystemExit(f"{d}/matcher.pkl was not trained with PRODUCTION_PARAMS; re-run src.matching.train")
+    if "T" in models["base"].get("feature_groups", ()):
+        extra = ()  # the first-stage features already hold the token-alignment group
     ctx = HybridDev(native=False, cap=a.cap)
     p20 = pd.read_parquet(f"{K20}/oof.parquet", columns=["prob"])["prob"].to_numpy()
     p50 = pd.read_parquet(f"{K50}/oof.parquet", columns=["prob"])["prob"].to_numpy()
