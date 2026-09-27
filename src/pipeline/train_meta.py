@@ -128,7 +128,10 @@ def main(argv=None):
         "thresholds": {"base": float(t_base), "deep": float(t_deep)},
         "hybrid": {"base_top_k": models["base"]["top_k"], "deep_top_k": models["deep"]["top_k"], "cap": a.cap},
         "first_stage_sha256": {"base": sha256(f"{K20}/matcher.pkl"), "deep": sha256(f"{K50}/matcher.pkl")},
-        "fingerprints": {"base": fingerprint(K20), "deep": fingerprint(K50)},
+        "fingerprints": {
+            "base": fingerprint(K20, tuple(models["base"].get("feature_groups", ()))),
+            "deep": fingerprint(K50, tuple(models["deep"].get("feature_groups", ()))),
+        },
     }
     report = {"out": a.out, "meta_rows": int(len(rows)), "meta_features": int(M.shape[1]),
               "thresholds": bundle["thresholds"], "thresholds_per_fold": per_fold,
