@@ -132,7 +132,9 @@ def analyze(out=f"{OUT_DIR}/blocker_fn1.json"):
 # ---------------------------------------------------------------- targeted rescue channels
 # channel -> (fields with weights, max_df): P2's own token fields and vocabulary rules (engine.CountryIndex)
 CHANNELS = {"trigram": ((("g", 1.0),), 2000),                  # the engine's trigram fallback vocabulary
-            "address": ((("a", 1.5), ("ab", 1.0)), 20000)}     # rare address tokens / bigrams, P2's weights
+            "address": ((("a", 1.5), ("ab", 1.0)), 20000),     # rare address tokens / bigrams, P2's weights
+            "name": ((("n", 1.0),), 20000),                    # rare name tokens alone
+            "phonetic": ((("p", 0.5), ("pb", 0.5)), 20000)}    # phonetic keys (transliteration-aware), P2's weights
 
 
 def token_rescue(ctx, channel="trigram", depth=10, chunk=500, cache_root="data/processed/blocking", log=print):
@@ -214,10 +216,10 @@ def token_rescue(ctx, channel="trigram", depth=10, chunk=500, cache_root="data/p
     return pd.DataFrame(parts, columns=["s1_id", "cand_id", "rescue_rank", "tri_score"])
 
 
-def rescue_candidates(ctx, channel):
-    path = f"{OUT_DIR}/rescue_{channel}10.parquet"
+def rescue_candidates(ctx, channel, depth=10):
+    path = f"{OUT_DIR}/rescue_{channel}{depth}.parquet"
     if not os.path.exists(path):
-        token_rescue(ctx, channel).to_parquet(path)  # git-ignored
+        token_rescue(ctx, channel, depth=depth).to_parquet(path)  # git-ignored
     return pd.read_parquet(path)
 
 
