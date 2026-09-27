@@ -391,7 +391,21 @@ def strict_meta(first="M0", decoy=False, first_decoy=False, log=print):
 
     tag = first + ("_decoy" if decoy else "") + ("_firstdecoy" if first_decoy else "")
     out = f"{OUT_DIR}/structured_15c_strict_{tag}.json"
-    params = MODELS[first]  # first-stage matcher configuration (checkpoint 14)
+    if first == "XGB":  # checkpoint D: the one predefined XGBoost configuration (src/evaluation/gbdt_experiment.py)
+        from xgboost import XGBClassifier
+
+        from src.evaluation.gbdt_experiment import XGB
+
+        def fit_first(X, y):
+            return XGBClassifier(**XGB).fit(np.asarray(X, dtype=np.float32), y)
+    else:
+        params = MODELS[first]  # first-stage matcher configuration (checkpoint 14)
+
+        def fit_first(X, y):
+            return train(X, y, **params)
+
+    def prob_first(model, X):
+        return model.predict_proba(np.asarray(X, dtype=np.float32) if first == "XGB" else X)[:, 1]
     ctx = HybridDev(native=False)
     p20_ref = pd.read_parquet("output/candidates_p3/k20/oof.parquet", columns=["prob"])["prob"].to_numpy()
     p50_ref = pd.read_parquet("output/candidates_p3/k50/oof.parquet", columns=["prob"])["prob"].to_numpy()
@@ -424,10 +438,10 @@ def strict_meta(first="M0", decoy=False, first_decoy=False, log=print):
                 continue
             for X, y, f, p in ((X20, y20, f20, p20), (X50, y50, f50, p50)):
                 tr, va = (f != k) & (f != j), f == j
-                p[va] = train(X[tr], y[tr], **params).predict_proba(X[va])[:, 1]
+                p[va] = prob_first(fit_first(X[tr], y[tr]), X[va])
         for X, y, f, p, fin in ((X20, y20, f20, p20, p20_fin), (X50, y50, f50, p50, p50_fin)):
             tr, va = f != k, f == k  # first stage for fold k: trained on the four other folds only
-            p[va] = fin[va] = train(X[tr], y[tr], **params).predict_proba(X[va])[:, 1]
+            p[va] = fin[va] = prob_first(fit_first(X[tr], y[tr]), X[va])
         log(f"  fold {k}: first stage done, {time.time() - t_start:.0f}s")
         T = Table(ctx, p20, p50)
         train_s1 = T.fold != k
@@ -652,7 +666,7 @@ def count(out=f"{OUT_DIR}/structured_15d.json"):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("stage", choices=["analyze", "adaptive", "meta", "strict_meta", "count", "competition"])
-    ap.add_argument("--first", default="M0", help="strict_meta: first-stage model of checkpoint 14 (M0-M3)")
+    ap.add_argument("--first", default="M0", help="strict_meta: first-stage model (M0-M3 of checkpoint 14, or XGB)")
     ap.add_argument("--decoy", action="store_true", help="strict_meta: token-alignment features in the meta-model")
     ap.add_argument("--first-decoy", action="store_true", help="strict_meta: ... and in the first-stage matchers")
     a = ap.parse_args(argv)

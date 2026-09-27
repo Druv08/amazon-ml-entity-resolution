@@ -940,6 +940,10 @@ applying the meta decoder over the whole run at once (vectorised exclusivity).
 | 5k (0.9574 bundle) | 16,162 / 358 | 25,063 | identical | identical | PASS | 200 s (CPU shared with a training job) |
 | 50k (0.9574 bundle) | 161,281 / 3,360 | 246,310 | not re-derived (see note) | | | 448 s (CPU shared) |
 | **5k (final bundle, group T)** | 16,004 / 331 | 22,997 | identical | identical | PASS | 154 s |
+| **50k (final bundle, group T)** | 159,530 / 3,348 | 226,794 | identical | identical | PASS | 555 s |
+
+With group T, 50k production takes 555 s, versus 448 s without it: every row's token alignment is now computed. The
+offline reference took 1,302 s.
 
 The first 50k offline reference hit a quadratic `np.isin` on string candidate ids inside `meta_decoder.decide`
 (NumPy loops in Python for object arrays). The ids are now factorized to integers, and `decide` handles 2.5M rows
