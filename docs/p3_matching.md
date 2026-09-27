@@ -717,10 +717,14 @@ Paired XGBoost − HGB:
 - **First stage only:** +0.0014 ± 0.0004, CI [+0.0007, +0.0021].
 - **With meta + decoy:** **+0.0016 ± 0.0004, CI [+0.0008, +0.0025]**, with India +0.0032 and US +0.0006.
 
-XGBoost 5-fold OOF takes 152 s at K=20 and 228 s at K=50, faster than M3. It clears the +0.0015 adoption bar only
-narrowly. Using it in production also needs the decoy features inside the first-stage feature set (a
-`build_features` group), a model-family switch in `train.py`, and a re-verified bundle. That is not done yet, and it
-is the recommended next step.
+XGBoost 5-fold OOF takes 152 s at K=20 and 228 s at K=50, faster than M3.
+
+**Strictly nested check** (`strict_meta --first XGB --decoy --first-decoy`, 16 min):
+- **First stage alone:** 0.9636 for XGBoost vs 0.9627 for HGB, +0.0009 [+0.0001, +0.0017].
+- **With the meta decoder:** 0.9650 vs 0.9643, **+0.0007 ± 0.0004 [−0.0002, +0.0015]**; India +0.0020, US −0.0002.
+
+The cross-fitted +0.0016 shrinks to +0.0007 under strict evaluation: below the +0.0015 bar, with a CI touching zero.
+**XGBoost is not adopted;** production stays HGB (M3 + group T + meta decoder).
 
 ### Candidate ceiling: targeted rescue cannot pass 0.990
 
