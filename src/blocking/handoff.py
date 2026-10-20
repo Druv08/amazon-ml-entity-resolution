@@ -52,7 +52,9 @@ def load_ground_truth_pairs(data_dir="data/raw/train"):
 
 
 class CandidateStore:
-    def __init__(self, split, out_dir="output/candidates", data_dir=None):
+    def __init__(self, split, out_dir="output/candidates", data_dir=None, tables=None):
+        """tables: the already-loaded source_tables() of another store of the same split and data_dir, shared
+        instead of loaded again (1-2 GB for a full split) when two candidate runs are read together."""
         self.split = split
         self.run_dir = os.path.join(out_dir, split)
         self.data_dir = data_dir or os.path.join("data", "raw", split)
@@ -62,7 +64,7 @@ class CandidateStore:
                                     f"python -m src.blocking.generate_candidates --split {split}")
         with open(meta, encoding="utf-8") as f:
             self.meta = json.load(f)
-        self._tables = None
+        self._tables = tables
 
     @property
     def shard_paths(self):
@@ -96,7 +98,9 @@ class CandidateStore:
                     out = np.empty(len(df), dtype=object)
                     for s in (2, 3):
                         m = (df["candidate_source"] == s).to_numpy()
-                        out[m] = tables[s][src_col].to_numpy()[df.loc[m, "candidate_row"].to_numpy()]
+                        # take the shard's rows first: converting the whole multi-million-row column per shard
+                        # made every shard read cost ~2 s regardless of its size
+                        out[m] = tables[s][src_col].take(df.loc[m, "candidate_row"].to_numpy()).to_numpy()
                     df[col] = out
             if truth is not None:
                 df["label"] = [int((a, b) in truth) for a, b in zip(df["s1_entity_id"], df["candidate_entity_id"])]

@@ -292,7 +292,7 @@ def main():
     parser.add_argument(
         "--test-dir",
         "-t",
-        default="dataset/test",
+        default="data/raw/test",
         help="Folder with test_source1/2/3.tsv (default: %(default)s). "
         "test_source2/3.tsv are only read when --check-ids is given.",
     )
